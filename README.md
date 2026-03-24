@@ -1,3 +1,6 @@
+# Download pre-trained models from HuggingFace
+uv run yale-qc download-models
+
 # Download 5,000 images (seed 1337, max 1500px, 20 threads)
 uv run yale-qc download -n 5000
 

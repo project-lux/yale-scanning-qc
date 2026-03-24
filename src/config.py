@@ -2,6 +2,9 @@
 
 from pathlib import Path
 
+# HuggingFace model repository
+HF_REPO_ID = "yale-cultural-heritage/yale-scanning-qc"
+
 # Project paths
 PROJECT_ROOT = Path(__file__).parent.parent
 DATA_DIR = PROJECT_ROOT / "data"

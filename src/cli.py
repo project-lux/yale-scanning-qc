@@ -13,14 +13,18 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Commands:
-  download     Download images from IIIF manifests
-  augment      Augment images for training
-  prepare      Prepare datasets for YOLO training
-  train        Train YOLO26 models
-  serve        Run the QC web app
-  analyze      Analyze a single image
+  download-models  Download pre-trained YOLO models from HuggingFace
+  download         Download images from IIIF manifests
+  augment          Augment images for training
+  prepare          Prepare datasets for YOLO training
+  train            Train YOLO26 models
+  serve            Run the QC web app
+  analyze          Analyze a single image
 
 Examples:
+  # Download pre-trained models from HuggingFace
+  uv run yale-qc download-models
+
   # Download 5000 images from manifests
   uv run yale-qc download -n 5000
 
@@ -42,6 +46,11 @@ Examples:
     )
 
     subparsers = parser.add_subparsers(dest="command", help="Command to run")
+
+    # Download models command
+    dm_parser = subparsers.add_parser("download-models", help="Download pre-trained YOLO models from HuggingFace")
+    dm_parser.add_argument("-o", "--output-dir", type=Path, help="Directory to save models (default: models/)")
+    dm_parser.add_argument("--force", action="store_true", help="Re-download even if models already exist")
 
     # Download command
     dl_parser = subparsers.add_parser("download", help="Download images from manifests")
@@ -87,7 +96,35 @@ Examples:
 
     args = parser.parse_args()
 
-    if args.command == "download":
+    if args.command == "download-models":
+        from huggingface_hub import hf_hub_download
+        from .config import MODELS_DIR, QC_CATEGORIES, HF_REPO_ID
+
+        output_dir = args.output_dir or MODELS_DIR
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        model_files = [
+            config["model"]
+            for config in QC_CATEGORIES.values()
+            if config.get("model")
+        ]
+
+        for filename in model_files:
+            dest = output_dir / filename
+            if dest.exists() and not args.force:
+                print(f"  - {filename} already exists, skipping (use --force to re-download)")
+                continue
+            print(f"  Downloading {filename}...")
+            hf_hub_download(
+                repo_id=HF_REPO_ID,
+                filename=filename,
+                local_dir=output_dir,
+            )
+            print(f"  ✓ {filename}")
+
+        print(f"\nModels saved to {output_dir}")
+
+    elif args.command == "download":
         from .downloader import download_images, DEFAULT_MANIFEST_FILE
         from .config import RAW_IMAGES_DIR
 
