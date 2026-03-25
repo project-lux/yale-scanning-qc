@@ -278,31 +278,26 @@ class QCAnalyzer:
             return cv2.rotate(image, cv2.ROTATE_90_COUNTERCLOCKWISE)
         return image
 
-    def analyze(self, image: np.ndarray, parallel: bool = True, skew_threshold: float = 0.95) -> dict:
+    def analyze(
+        self,
+        image: np.ndarray,
+        parallel: bool = True,
+        skew_threshold: float = 0.95,
+        categories: Optional[list[str]] = None,
+    ) -> dict:
         """
-        Run all QC checks on an image.
+        Run QC checks on an image.
 
         Args:
             image: Input image (BGR format)
-            parallel: If True, run all checks simultaneously (faster)
+            parallel: If True, run checks simultaneously (faster)
             skew_threshold: Confidence threshold for skew pass/fail
+            categories: If provided, only run these checks. Otherwise run all.
 
         Returns:
             Dict with results for each check category
         """
-        if not parallel:
-            # Sequential execution
-            return {
-                "focus": self.analyze_focus(image),
-                "obstruction": self.analyze_obstruction(image),
-                "orientation": self.analyze_orientation(image),
-                "dust": self.analyze_dust(image),
-                "skew": self.analyze_skew(image, skew_threshold),
-            }
-
-        # Parallel execution - all 5 checks run simultaneously
-        results = {}
-        checks = {
+        all_checks = {
             "focus": lambda: self.analyze_focus(image),
             "obstruction": lambda: self.analyze_obstruction(image),
             "orientation": lambda: self.analyze_orientation(image),
@@ -310,14 +305,21 @@ class QCAnalyzer:
             "skew": lambda: self.analyze_skew(image, skew_threshold),
         }
 
-        with ThreadPoolExecutor(max_workers=5) as executor:
-            # Submit all tasks
+        if categories is not None:
+            checks = {k: v for k, v in all_checks.items() if k in categories}
+        else:
+            checks = all_checks
+
+        if not parallel:
+            return {name: func() for name, func in checks.items()}
+
+        results = {}
+        with ThreadPoolExecutor(max_workers=len(checks) or 1) as executor:
             futures = {
                 executor.submit(func): name
                 for name, func in checks.items()
             }
 
-            # Collect results as they complete
             for future in as_completed(futures):
                 name = futures[future]
                 try:

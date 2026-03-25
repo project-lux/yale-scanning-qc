@@ -32,6 +32,21 @@ EPOCHS = 100
 BATCH_SIZE = 16
 IMG_SIZE = 640
 
+# QC scanning workflow defaults
+DEFAULT_ENABLED_MODELS = ["focus", "dust", "obstruction"]
+LAST_DIR_FILE = PROJECT_ROOT / ".last_directory"
+
+# QC subdirectory names (created under watched directory)
+QC_SUBDIR = "qc"
+QC_CACHE_DIR = "cache"
+QC_FAILED_TIFFS_DIR = "failed-tiffs"
+QC_TRUE_POSITIVE_DIR = "true-positive"
+QC_FALSE_POSITIVE_DIR = "false-positive"
+
+# JPEG conversion settings (for TIFF -> JPEG cache)
+JPEG_QUALITY = 85
+JPEG_MAX_SIDE = 2500
+
 # QC Categories
 QC_CATEGORIES = {
     "focus": {
@@ -67,7 +82,7 @@ DETECTION_COLORS = {
     "finger": (0, 165, 255),    # Light orange
     "shadow": (128, 128, 128),  # Gray
     "object": (0, 0, 255),      # Red
-    # Dust colors  
+    # Dust colors
     "dust_speck": (255, 0, 255),  # Magenta
     "scratch": (255, 255, 0),     # Cyan
     "smudge": (0, 255, 255),      # Yellow
