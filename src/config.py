@@ -42,6 +42,7 @@ QC_CACHE_DIR = "cache"
 QC_FAILED_TIFFS_DIR = "failed-tiffs"
 QC_TRUE_POSITIVE_DIR = "true-positive"
 QC_FALSE_POSITIVE_DIR = "false-positive"
+QC_FALSE_NEGATIVE_DIR = "false-negative"
 
 # JPEG conversion settings (for TIFF -> JPEG cache)
 JPEG_QUALITY = 85

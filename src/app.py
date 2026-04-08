@@ -26,6 +26,7 @@ from .scanner import (
     accept_file,
     ensure_jpeg_cached,
     ensure_qc_dirs,
+    false_negative_file,
     get_file_status,
     ignore_file,
     jpeg_cache_path,
@@ -536,6 +537,37 @@ def api_ignore(filename: str):
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/file/<filename>/false-negative", methods=["POST"])
+def api_false_negative(filename: str):
+    """Flag a scan the models missed (false negative)."""
+    if watch_dir is None:
+        return jsonify({"error": "No directory selected"}), 400
+
+    data = request.get_json(force=True) if request.is_json else {}
+    missed_category = data.get("category", "").strip()
+    missed_class = data.get("class_name", "").strip()
+    notes = data.get("notes", "").strip()
+
+    if not missed_category or not missed_class:
+        return jsonify({"error": "Category and class are required"}), 400
+
+    with _lock:
+        state = file_states.get(filename)
+        results = state["results"] if state and state.get("results") else {}
+
+    try:
+        false_negative_file(
+            watch_dir, filename, results, enabled_models,
+            missed_category, missed_class, notes,
+        )
+        with _lock:
+            file_states[filename] = {"status": "false-negative", "results": results}
+            _persist_state()
+        return jsonify({"status": "false-negative"})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 def _detection_colors_hex() -> dict[str, dict[str, str]]:
     """Return DETECTION_COLORS grouped by category, converted from BGR to hex RGB."""
     colors: dict[str, dict[str, str]] = {}
@@ -554,9 +586,14 @@ def api_settings():
     global enabled_models
     if request.method == "GET":
         all_cats = list(QC_CATEGORIES.keys())
+        cat_classes = {
+            name: info.get("classes", [])
+            for name, info in QC_CATEGORIES.items()
+        }
         return jsonify({
             "enabled": enabled_models,
             "available": all_cats,
+            "category_classes": cat_classes,
             "detection_colors": _detection_colors_hex(),
         })
 
@@ -760,6 +797,8 @@ body { font-family:'Inter',system-ui,sans-serif; background:var(--gray-5); color
 .badge-clean { background:rgba(140,198,63,.25); color:#8cc63f; }
 .badge-accepted { background:rgba(255,255,255,.1); color:var(--gray-3); }
 .badge-ignored { background:rgba(99,170,255,.15); color:var(--yale-blue-lighter); }
+.dot-false-negative { background:#e04040; box-shadow:0 0 6px #e04040; }
+.badge-false-negative { background:#e04040; color:var(--white); }
 .tree-subdir-header {
     display:flex; align-items:center; gap:.4rem; padding:.45rem 1rem .45rem .8rem;
     cursor:pointer; font-size:.82rem; user-select:none; transition:background .1s;
@@ -805,6 +844,49 @@ body { font-family:'Inter',system-ui,sans-serif; background:var(--gray-5); color
 .btn-accept:hover { background:#d4621f; }
 .btn-ignore { background:var(--gray-4); color:var(--gray-2); }
 .btn-ignore:hover { background:#ccc; }
+.btn-flag { background:#e04040; color:var(--white); }
+.btn-flag:hover { background:#c93030; }
+
+/* ---- False-negative modal ---- */
+.fn-modal-backdrop {
+    display:none; position:fixed; inset:0; background:rgba(0,0,0,.45);
+    z-index:300; align-items:center; justify-content:center;
+}
+.fn-modal-backdrop.active { display:flex; }
+.fn-modal {
+    background:var(--white); border-radius:12px; width:460px; max-width:92vw;
+    box-shadow:0 12px 40px rgba(0,0,0,.25); overflow:hidden;
+}
+.fn-modal-header {
+    padding:1rem 1.25rem; border-bottom:1px solid var(--gray-4);
+    display:flex; align-items:center; justify-content:space-between;
+}
+.fn-modal-header h2 { font-size:.95rem; font-weight:600; color:var(--gray-1); }
+.fn-modal-body { padding:1.25rem; display:flex; flex-direction:column; gap:1rem; }
+.fn-field label {
+    display:block; font-size:.72rem; text-transform:uppercase; letter-spacing:.06em;
+    color:var(--gray-3); margin-bottom:.35rem; font-weight:600;
+}
+.fn-field select, .fn-field textarea {
+    width:100%; padding:.55rem .7rem; border:1px solid var(--gray-4); border-radius:6px;
+    font-size:.85rem; font-family:inherit; color:var(--gray-1); background:var(--white);
+    outline:none; transition:border-color .15s;
+}
+.fn-field select:focus, .fn-field textarea:focus { border-color:var(--yale-blue-lighter); }
+.fn-field textarea { resize:vertical; min-height:70px; }
+.fn-modal-footer {
+    padding:.75rem 1.25rem; border-top:1px solid var(--gray-4);
+    display:flex; justify-content:flex-end; gap:.5rem;
+}
+.fn-modal-footer button {
+    padding:.5rem 1.2rem; border:none; border-radius:6px; font-size:.82rem;
+    font-weight:600; cursor:pointer; font-family:inherit;
+}
+.fn-submit { background:#e04040; color:var(--white); }
+.fn-submit:hover { background:#c93030; }
+.fn-submit:disabled { opacity:.5; cursor:not-allowed; }
+.fn-cancel { background:var(--gray-4); color:var(--gray-2); }
+.fn-cancel:hover { background:#ccc; }
 
 .content { flex:1; padding:1.5rem 2rem; overflow-y:auto; }
 .empty-state {
@@ -1037,6 +1119,33 @@ body { font-family:'Inter',system-ui,sans-serif; background:var(--gray-5); color
     </div>
 </div>
 
+<div class="fn-modal-backdrop" id="fnModal">
+    <div class="fn-modal">
+        <div class="fn-modal-header">
+            <h2>Flag Missed Issue</h2>
+            <button class="modal-close" id="fnModalClose">&times;</button>
+        </div>
+        <div class="fn-modal-body">
+            <div class="fn-field">
+                <label>What did the model miss?</label>
+                <select id="fnCategory"></select>
+            </div>
+            <div class="fn-field">
+                <label>Specific issue</label>
+                <select id="fnClass"></select>
+            </div>
+            <div class="fn-field">
+                <label>Notes (optional)</label>
+                <textarea id="fnNotes" placeholder="Describe what was wrong with the scan..."></textarea>
+            </div>
+        </div>
+        <div class="fn-modal-footer">
+            <button class="fn-cancel" id="fnCancelBtn">Cancel</button>
+            <button class="fn-submit" id="fnSubmitBtn">Submit Report</button>
+        </div>
+    </div>
+</div>
+
 <script>
 const $ = s => document.querySelector(s);
 const dirInput   = $('#dirInput');
@@ -1060,6 +1169,7 @@ let fileResults = {};
 let enabledModels = [];
 let availableModels = [];
 let detectionColors = {};
+let categoryClasses = {};
 let lastVersion = -1;
 let dirLoaded = false;
 let currentDirName = '';
@@ -1086,6 +1196,7 @@ let panStartX = 0, panStartY = 0;
     enabledModels = d.enabled;
     availableModels = d.available;
     detectionColors = d.detection_colors || {};
+    categoryClasses = d.category_classes || {};
     renderModelChecks();
 
     try {
@@ -1329,6 +1440,7 @@ function renderFiles(){
             if(f.status==='clean')    badge='<span class="file-badge badge-clean">pass</span>';
             if(f.status==='accepted') badge='<span class="file-badge badge-accepted">accepted</span>';
             if(f.status==='ignored')  badge='<span class="file-badge badge-ignored">ignored</span>';
+            if(f.status==='false-negative') badge='<span class="file-badge badge-false-negative">missed</span>';
             el.innerHTML = `<span class="file-dot dot-${f.status}"></span><span class="tree-file-name">${f.name}</span>${badge}`;
             el.onclick = () => selectFile(f.name);
             body.appendChild(el);
@@ -1585,8 +1697,9 @@ function showFile(name){
     topFilename.innerHTML = '<span class="topbar-dir">' + dirPath + '/</span><span class="topbar-name">' + name + '</span>';
 
     const st = f ? f.status : 'pending';
-    topStatus.className = 'topbar-status ' + (st==='clean'||st==='ignored'?'status-pass': st==='flagged'?'status-fail':'status-pending');
-    topStatus.textContent = st.toUpperCase();
+    const stClass = (st==='clean'||st==='ignored') ? 'status-pass' : (st==='flagged'||st==='false-negative') ? 'status-fail' : 'status-pending';
+    topStatus.className = 'topbar-status ' + stClass;
+    topStatus.textContent = st === 'false-negative' ? 'MISSED ISSUE' : st.toUpperCase();
 
     topActions.innerHTML = '';
     if(st === 'flagged'){
@@ -1600,6 +1713,14 @@ function showFile(name){
         ignBtn.onclick = () => doIgnore(name);
         topActions.appendChild(accBtn);
         topActions.appendChild(ignBtn);
+    }
+    if(st === 'clean' || st === 'flagged' || st === 'ignored'){
+        const fnBtn = document.createElement('button');
+        fnBtn.className = 'btn btn-flag';
+        fnBtn.textContent = 'Flag Issue';
+        fnBtn.title = 'Report an issue the models missed';
+        fnBtn.onclick = () => openFnModal(name);
+        topActions.appendChild(fnBtn);
     }
 
     if(!results){
@@ -1695,6 +1816,70 @@ function advanceToNextFlagged(currentName){
     if(next) selectFile(next.name);
     else showFile(currentName);
 }
+
+/* ---- False-negative modal ---- */
+const fnModal = document.getElementById('fnModal');
+const fnCategory = document.getElementById('fnCategory');
+const fnClass = document.getElementById('fnClass');
+const fnNotes = document.getElementById('fnNotes');
+const fnSubmitBtn = document.getElementById('fnSubmitBtn');
+let fnTargetFile = null;
+
+document.getElementById('fnModalClose').onclick = closeFnModal;
+document.getElementById('fnCancelBtn').onclick = closeFnModal;
+
+function openFnModal(filename){
+    fnTargetFile = filename;
+    fnNotes.value = '';
+
+    fnCategory.innerHTML = '<option value="">-- Select category --</option>';
+    for(const cat of Object.keys(categoryClasses)){
+        fnCategory.innerHTML += '<option value="' + cat + '">' + cat + '</option>';
+    }
+    fnClass.innerHTML = '<option value="">-- Select category first --</option>';
+    fnSubmitBtn.disabled = true;
+    fnModal.classList.add('active');
+}
+
+function closeFnModal(){ fnModal.classList.remove('active'); fnTargetFile = null; }
+
+fnCategory.onchange = function(){
+    const cat = fnCategory.value;
+    fnClass.innerHTML = '<option value="">-- Select issue --</option>';
+    if(cat && categoryClasses[cat]){
+        categoryClasses[cat].forEach(function(cls){
+            fnClass.innerHTML += '<option value="' + cls + '">' + cls.replace(/_/g, ' ') + '</option>';
+        });
+    }
+    fnSubmitBtn.disabled = !fnCategory.value || !fnClass.value;
+};
+
+fnClass.onchange = function(){
+    fnSubmitBtn.disabled = !fnCategory.value || !fnClass.value;
+};
+
+fnSubmitBtn.onclick = async function(){
+    if(!fnTargetFile || !fnCategory.value || !fnClass.value) return;
+    const targetFile = fnTargetFile;
+    const cat = fnCategory.value;
+    const cls = fnClass.value;
+    const notes = fnNotes.value;
+    closeFnModal();
+    showLoading('Reporting issue...');
+    try {
+        const r = await fetch('/api/file/' + encodeURIComponent(targetFile) + '/false-negative', {
+            method:'POST',
+            headers:{'Content-Type':'application/json'},
+            body:JSON.stringify({ category: cat, class_name: cls, notes: notes })
+        });
+        const d = await r.json();
+        if(d.error){ alert(d.error); return; }
+        const idx = files.findIndex(function(f){ return f.name === targetFile; });
+        if(idx >= 0) files[idx].status = 'false-negative';
+        renderFiles();
+        showFile(targetFile);
+    } finally { hideLoading(); }
+};
 
 function showLoading(msg){ loadingTxt.textContent=msg||'Loading...'; loadingOv.classList.add('active'); }
 function hideLoading(){ loadingOv.classList.remove('active'); }

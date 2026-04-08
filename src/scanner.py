@@ -18,6 +18,7 @@ from .config import (
     JPEG_QUALITY,
     QC_CACHE_DIR,
     QC_FAILED_TIFFS_DIR,
+    QC_FALSE_NEGATIVE_DIR,
     QC_FALSE_POSITIVE_DIR,
     QC_SUBDIR,
     QC_TRUE_POSITIVE_DIR,
@@ -47,9 +48,13 @@ def _fp_dir(watch_dir: Path) -> Path:
     return _qc_root(watch_dir) / QC_FALSE_POSITIVE_DIR
 
 
+def _fn_dir(watch_dir: Path) -> Path:
+    return _qc_root(watch_dir) / QC_FALSE_NEGATIVE_DIR
+
+
 def ensure_qc_dirs(watch_dir: Path) -> None:
     """Create all QC subdirectories under the watched directory."""
-    for d in [_cache_dir(watch_dir), _failed_dir(watch_dir), _tp_dir(watch_dir), _fp_dir(watch_dir)]:
+    for d in [_cache_dir(watch_dir), _failed_dir(watch_dir), _tp_dir(watch_dir), _fp_dir(watch_dir), _fn_dir(watch_dir)]:
         d.mkdir(parents=True, exist_ok=True)
 
 
@@ -120,6 +125,8 @@ def get_file_status(watch_dir: Path, tiff_name: str) -> str:
         return "accepted"
     if (_fp_dir(watch_dir) / f"{base}.json").exists():
         return "ignored"
+    if (_fn_dir(watch_dir) / f"{base}.json").exists():
+        return "false-negative"
 
     return "pending"
 
@@ -278,3 +285,61 @@ def ignore_file(watch_dir: Path, tiff_name: str, results: dict, models_used: lis
     fp_jpeg = _fp_dir(watch_dir) / f"{base}.jpg"
     if cached_jpeg.exists():
         shutil.copy2(cached_jpeg, fp_jpeg)
+
+
+def false_negative_file(
+    watch_dir: Path,
+    tiff_name: str,
+    results: dict,
+    models_used: list[str],
+    missed_category: str,
+    missed_class: str,
+    notes: str = "",
+) -> None:
+    """
+    Handle a *False Negative* report — the model said pass but there is an issue.
+
+    1. Save metadata + JPEG to false-negative/
+    2. Move the original TIF to failed-tiffs/
+    """
+    base = Path(tiff_name).stem
+    tiff_path = watch_dir / tiff_name
+
+    tif_size = None
+    if tiff_path.exists():
+        with Image.open(tiff_path) as img:
+            tif_size = img.size
+
+    dest_dir = _fn_dir(watch_dir)
+    dest_dir.mkdir(parents=True, exist_ok=True)
+
+    meta = {
+        "filename": tiff_name,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "models_used": models_used,
+        "results": {
+            k: v for k, v in results.items()
+            if isinstance(v, dict) and "status" in v
+        },
+        "overall": results.get("overall", "unknown"),
+        "decision": "false-negative",
+        "missed_category": missed_category,
+        "missed_class": missed_class,
+        "notes": notes,
+    }
+    if tif_size:
+        meta["image_size"] = list(tif_size)
+
+    json_path = dest_dir / f"{base}.json"
+    with open(json_path, "w") as f:
+        json.dump(meta, f, indent=2, default=str)
+
+    cached_jpeg = jpeg_cache_path(watch_dir, tiff_name)
+    fn_jpeg = dest_dir / f"{base}.jpg"
+    if cached_jpeg.exists():
+        shutil.copy2(cached_jpeg, fn_jpeg)
+
+    failed_dest = _failed_dir(watch_dir) / tiff_name
+    _failed_dir(watch_dir).mkdir(parents=True, exist_ok=True)
+    if tiff_path.exists():
+        shutil.move(str(tiff_path), str(failed_dest))
