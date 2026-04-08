@@ -33,7 +33,7 @@ BATCH_SIZE = 16
 IMG_SIZE = 640
 
 # QC scanning workflow defaults
-DEFAULT_ENABLED_MODELS = ["focus", "dust", "obstruction"]
+DEFAULT_ENABLED_MODELS = ["focus", "obstruction"]
 LAST_DIR_FILE = PROJECT_ROOT / ".last_directory"
 
 # QC subdirectory names (created under watched directory)
