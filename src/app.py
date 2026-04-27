@@ -7,12 +7,28 @@ false-positive (ignore) to build training data.
 """
 
 import base64
+import os
+import secrets
 import threading
+from functools import wraps
 from pathlib import Path
 
 import cv2
 import numpy as np
-from flask import Flask, jsonify, render_template_string, request, send_file
+from dotenv import load_dotenv
+from flask import (
+    Flask,
+    jsonify,
+    redirect,
+    render_template_string,
+    request,
+    send_file,
+    session,
+    url_for,
+)
+from werkzeug.security import check_password_hash, generate_password_hash
+
+load_dotenv(Path(__file__).parent.parent / ".env")
 
 from .config import (
     DEFAULT_ENABLED_MODELS,
@@ -36,6 +52,53 @@ from .scanner import (
 )
 
 app = Flask(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Authentication
+# ---------------------------------------------------------------------------
+
+_AUTH_USERNAME = (os.environ.get("ADMIN_USERNAME") or "admin").strip()
+_AUTH_PASSWORD_PLAIN = (os.environ.get("ADMIN_PASSWORD") or "").strip()
+
+if not _AUTH_PASSWORD_PLAIN:
+    raise RuntimeError(
+        "ADMIN_PASSWORD is not set. Copy .env.example to .env and set "
+        "ADMIN_USERNAME / ADMIN_PASSWORD before starting the app."
+    )
+
+_AUTH_PWHASH = generate_password_hash(_AUTH_PASSWORD_PLAIN)
+del _AUTH_PASSWORD_PLAIN
+
+app.secret_key = (os.environ.get("SECRET_KEY") or "").strip() or secrets.token_hex(32)
+app.config["SESSION_COOKIE_HTTPONLY"] = True
+app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
+app.permanent_session_lifetime = 60 * 60 * 12  # 12 hours
+
+_AUTH_EXEMPT_ENDPOINTS = {"login", "logout", "static"}
+
+
+def login_required(f):
+    @wraps(f)
+    def wrapped(*args, **kwargs):
+        if not session.get("user"):
+            if request.path.startswith("/api/"):
+                return jsonify({"error": "Not authenticated"}), 401
+            return redirect(url_for("login", next=request.path))
+        return f(*args, **kwargs)
+    return wrapped
+
+
+@app.before_request
+def _require_login():
+    if request.endpoint in _AUTH_EXEMPT_ENDPOINTS:
+        return None
+    if session.get("user"):
+        return None
+    if request.path.startswith("/api/"):
+        return jsonify({"error": "Not authenticated"}), 401
+    return redirect(url_for("login", next=request.path))
+
 
 # ---------------------------------------------------------------------------
 # App state (module-level singletons)
@@ -257,6 +320,32 @@ def draw_detections(image: np.ndarray, results: dict) -> np.ndarray:
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    error = None
+    if request.method == "POST":
+        username = (request.form.get("username") or "").strip()
+        password = request.form.get("password") or ""
+        if username == _AUTH_USERNAME and check_password_hash(_AUTH_PWHASH, password):
+            session.clear()
+            session["user"] = username
+            session.permanent = True
+            nxt = request.args.get("next") or request.form.get("next") or url_for("index")
+            if not nxt.startswith("/"):
+                nxt = url_for("index")
+            return redirect(nxt)
+        error = "Invalid username or password."
+
+    nxt = request.args.get("next", "")
+    return render_template_string(LOGIN_TEMPLATE, error=error, next=nxt)
+
+
+@app.route("/logout", methods=["GET", "POST"])
+def logout():
+    session.clear()
+    return redirect(url_for("login"))
+
 
 @app.route("/")
 def index():
@@ -661,6 +750,126 @@ def api_analyze_all():
 
 
 # ---------------------------------------------------------------------------
+# Login Template
+# ---------------------------------------------------------------------------
+LOGIN_TEMPLATE = r'''
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Sign in · Yale Scanning QC</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+:root {
+    --yale-blue:#00356b;
+    --yale-blue-dark:#002654;
+    --yale-blue-lighter:#286dc0;
+    --gray-1:#222;
+    --gray-3:#777;
+    --gray-4:#dcdcdc;
+    --gray-5:#f5f5f5;
+    --white:#fff;
+    --error:#c0392b;
+}
+* { box-sizing:border-box; margin:0; padding:0; }
+body {
+    font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
+    background:linear-gradient(135deg, var(--yale-blue) 0%, var(--yale-blue-dark) 100%);
+    color:var(--gray-1);
+    min-height:100vh;
+    display:flex; align-items:center; justify-content:center;
+    padding:1.5rem;
+}
+.login-card {
+    background:var(--white);
+    border-radius:14px;
+    box-shadow:0 18px 50px rgba(0,0,0,.35);
+    width:100%; max-width:380px;
+    padding:2.25rem 2rem 2rem;
+}
+.brand {
+    text-align:center; margin-bottom:1.5rem;
+}
+.brand-mark {
+    display:inline-flex; align-items:center; justify-content:center;
+    width:48px; height:48px; border-radius:12px;
+    background:var(--yale-blue); color:var(--white);
+    font-weight:700; font-size:1.1rem; letter-spacing:.04em;
+    margin-bottom:.75rem;
+}
+.brand h1 {
+    font-size:1.05rem; font-weight:600; color:var(--gray-1);
+    letter-spacing:.01em;
+}
+.brand p {
+    font-size:.78rem; color:var(--gray-3); margin-top:.2rem;
+}
+.field { margin-bottom:1rem; }
+.field label {
+    display:block; font-size:.72rem; text-transform:uppercase;
+    letter-spacing:.06em; color:var(--gray-3);
+    margin-bottom:.35rem; font-weight:600;
+}
+.field input {
+    width:100%; padding:.65rem .8rem;
+    border:1px solid var(--gray-4); border-radius:6px;
+    font-size:.9rem; font-family:inherit; color:var(--gray-1);
+    background:var(--white); outline:none;
+    transition:border-color .15s, box-shadow .15s;
+}
+.field input:focus {
+    border-color:var(--yale-blue-lighter);
+    box-shadow:0 0 0 3px rgba(40,109,192,.18);
+}
+.error {
+    background:rgba(192,57,43,.08); color:var(--error);
+    border:1px solid rgba(192,57,43,.25);
+    padding:.55rem .75rem; border-radius:6px;
+    font-size:.82rem; margin-bottom:1rem;
+}
+button.submit {
+    width:100%; padding:.7rem 1rem;
+    background:var(--yale-blue); color:var(--white);
+    border:none; border-radius:6px;
+    font-size:.9rem; font-weight:600; font-family:inherit;
+    cursor:pointer;
+    transition:background .15s;
+}
+button.submit:hover { background:var(--yale-blue-dark); }
+.footer-note {
+    text-align:center; margin-top:1.25rem;
+    font-size:.7rem; color:var(--gray-3);
+}
+</style>
+</head>
+<body>
+<form class="login-card" method="POST" action="{{ url_for('login') }}{% if next %}?next={{ next }}{% endif %}">
+    <div class="brand">
+        <div class="brand-mark">Y</div>
+        <h1>Yale Scanning QC</h1>
+        <p>Sign in to continue</p>
+    </div>
+    {% if error %}
+    <div class="error">{{ error }}</div>
+    {% endif %}
+    <input type="hidden" name="next" value="{{ next }}">
+    <div class="field">
+        <label for="u">Username</label>
+        <input id="u" name="username" type="text" autocomplete="username" required autofocus>
+    </div>
+    <div class="field">
+        <label for="p">Password</label>
+        <input id="p" name="password" type="password" autocomplete="current-password" required>
+    </div>
+    <button class="submit" type="submit">Sign in</button>
+    <div class="footer-note">Authorized personnel only</div>
+</form>
+</body>
+</html>
+'''
+
+
+# ---------------------------------------------------------------------------
 # HTML Template — Yale Scanning QC
 # ---------------------------------------------------------------------------
 HTML_TEMPLATE = r'''
@@ -701,6 +910,14 @@ body { font-family:'Inter',system-ui,sans-serif; background:var(--gray-5); color
 .sidebar-header { padding:1.25rem 1.25rem 1rem; border-bottom:1px solid rgba(255,255,255,.15); }
 .sidebar-header h1 { font-size:1.15rem; font-weight:700; letter-spacing:.02em; }
 .sidebar-header p { font-size:.75rem; opacity:.65; margin-top:.2rem; }
+.sidebar-header-row { display:flex; align-items:flex-start; justify-content:space-between; gap:.75rem; }
+.logout-link {
+    color:rgba(255,255,255,.7); font-size:.7rem; text-decoration:none;
+    padding:.3rem .55rem; border:1px solid rgba(255,255,255,.2);
+    border-radius:5px; transition:background .15s, color .15s, border-color .15s;
+    flex-shrink:0;
+}
+.logout-link:hover { background:rgba(255,255,255,.1); color:var(--white); border-color:rgba(255,255,255,.4); }
 
 .dir-section { padding:1rem 1.25rem; border-bottom:1px solid rgba(255,255,255,.15); }
 .dir-section label { font-size:.7rem; text-transform:uppercase; letter-spacing:.08em; opacity:.6; display:block; margin-bottom:.4rem; }
@@ -1048,8 +1265,13 @@ body { font-family:'Inter',system-ui,sans-serif; background:var(--gray-5); color
 
 <aside class="sidebar">
     <div class="sidebar-header">
-        <h1>Yale Scanning QC</h1>
-        <p>Quality Control</p>
+        <div class="sidebar-header-row">
+            <div>
+                <h1>Yale Scanning QC</h1>
+                <p>Quality Control</p>
+            </div>
+            <a class="logout-link" href="/logout" title="Sign out">Sign out</a>
+        </div>
     </div>
     <div class="dir-section">
         <label>Watch Directory</label>

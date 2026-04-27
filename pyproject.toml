@@ -19,6 +19,7 @@ dependencies = [
     "torchvision>=0.17.0",
     "huggingface-hub>=0.20.0",
     "watchdog>=4.0.0",
+    "python-dotenv>=1.0.0",
 ]
 
 [project.optional-dependencies]
