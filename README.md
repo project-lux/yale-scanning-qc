@@ -99,3 +99,57 @@ scanning workstation is ready as soon as it powers on.
 
 Tip: If the scheduled task doesn't start the server, open the latest
 `logs\qc-*.log` file — the full stdout + stderr is captured there.
+
+
+# ============================================================
+# Moving scans from DELL-i2S to the DSCA AI Project share
+# ============================================================
+
+`move-scans-to-share.bat` (at the project root) replaces Ja'nya's
+manual end-of-shift move. Double-click it (or a desktop shortcut to
+it) and it will:
+
+  1. Verify the destination share is reachable. If not, it aborts
+     BEFORE moving anything and prints a clear error.
+  2. Move every image file (*.tif, *.tiff, *.jpg, *.jpeg, *.png, and
+     common RAW types) from the configured source to the destination.
+     Non-image files on the Desktop (shortcuts, .docx, etc.) are
+     never touched.
+  3. Use `robocopy /MOV` so files are only deleted from the source
+     AFTER a verified copy at the destination.
+  4. Log everything to `logs\move-YYYYMMDD_HHMMSS.log` and pause at
+     the end so the operator can confirm the result.
+
+
+# ------------------------------------------------------------
+# One-time setup on DELL-i2S
+# ------------------------------------------------------------
+
+  1. Open `move-scans-to-share.bat` in Notepad and confirm the two
+     CONFIG lines near the top:
+
+       set "SOURCE=%USERPROFILE%\Desktop"
+       set "DEST=Y:\AI Project"
+
+     - SOURCE: leave as `%USERPROFILE%\Desktop` if Ja'nya saves
+       scans loose on the Desktop. Change to e.g.
+       `%USERPROFILE%\Desktop\Scans` if she puts them in a subfolder.
+     - DEST: must be the WINDOWS path to the DSCA AI Project share.
+       Either a mapped drive letter (`Y:\AI Project`) or the full
+       UNC path (`\\fileserver.yale.edu\DSCA_Digital_Studio-CC1702-LIBITS\AI Project`).
+       Open File Explorer → "This PC" to confirm which letter the
+       share is mounted under.
+
+  2. Make a Desktop shortcut so it's one click for Ja'nya:
+       - Right-click `move-scans-to-share.bat` → "Create shortcut"
+       - Drag the resulting shortcut onto the Desktop
+       - (Optional) rename it to "Move scans to Y drive"
+       - (Optional) right-click the shortcut → Properties → Change
+         Icon... and pick a folder/arrow icon so it stands out.
+
+  3. Test it once with a single throwaway image on the Desktop
+     before relying on it for a full day's scans.
+
+Tip: If something looks wrong, the latest `logs\move-*.log` has the
+complete robocopy output (including any files that failed to copy
+and were therefore NOT deleted from the source).
