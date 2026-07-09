@@ -13,35 +13,28 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Commands:
-  download-models  Download pre-trained YOLO models from HuggingFace
+  serve            Run the QC web app (scheduler included)
+  run-batch        Run one QC pass over the monitored directories now
+  retrain          Retrain a model from accumulated reviewer feedback
+  models           List registered model versions
+  activate-model   Activate a specific model version by id
+
+  download-models  Download pre-trained YOLO models from HuggingFace (legacy)
   download         Download images from IIIF manifests
   augment          Augment images for training
   prepare          Prepare datasets for YOLO training
-  train            Train YOLO26 models
-  serve            Run the QC web app
-  analyze          Analyze a single image
+  train            Train YOLO26 models (legacy multi-category)
+  analyze          Analyze a single image (legacy analyzer)
 
 Examples:
-  # Download pre-trained models from HuggingFace
-  uv run yale-qc download-models
+  # Run web app (UI + daily scheduler)
+  uv run yale-qc serve --host 0.0.0.0
 
-  # Download 5000 images from manifests
-  uv run yale-qc download -n 5000
+  # Run one pass right now (e.g. from Task Scheduler / cron)
+  uv run yale-qc run-batch
 
-  # Augment downloaded images
-  uv run yale-qc augment
-
-  # Prepare datasets for training
-  uv run yale-qc prepare
-
-  # Train all models
-  uv run yale-qc train
-
-  # Run web app
-  uv run yale-qc serve
-
-  # Analyze a single image
-  uv run yale-qc analyze path/to/image.jpg
+  # Retrain the binary bad-scan model from reviews
+  uv run yale-qc retrain --role badscan --epochs 50
         """
     )
 
@@ -88,6 +81,22 @@ Examples:
     serve_parser.add_argument("-p", "--port", type=int, default=5000)
     serve_parser.add_argument("-d", "--debug", action="store_true")
     serve_parser.add_argument("--host", default="127.0.0.1")
+
+    # Batch pipeline commands
+    rb_parser = subparsers.add_parser("run-batch", help="Run one QC pass now")
+    rb_parser.add_argument("--dirs", nargs="+", type=Path,
+                           help="Override monitored directories for this pass")
+
+    rt_parser = subparsers.add_parser("retrain", help="Retrain a model from reviewer feedback")
+    rt_parser.add_argument("--role", choices=["badscan", "pagetype"], default="badscan")
+    rt_parser.add_argument("-e", "--epochs", type=int, default=50)
+    rt_parser.add_argument("--no-activate", action="store_true",
+                           help="Register the new version without activating it")
+
+    subparsers.add_parser("models", help="List registered model versions")
+
+    am_parser = subparsers.add_parser("activate-model", help="Activate a model version")
+    am_parser.add_argument("model_id", type=int)
 
     # Analyze command
     analyze_parser = subparsers.add_parser("analyze", help="Analyze a single image")
@@ -184,6 +193,53 @@ Examples:
         from .app import app
         print(f"Starting QC app at http://{args.host}:{args.port}")
         app.run(host=args.host, port=args.port, debug=args.debug)
+
+    elif args.command == "run-batch":
+        from . import db, pipeline, registry
+
+        db.init_db()
+        registry.seed_registry()
+        dirs = [str(d.expanduser().resolve()) for d in args.dirs] if args.dirs else None
+        batch_id = pipeline.run_batch(trigger="manual", directories=dirs)
+        if batch_id is None:
+            print("A batch is already running.")
+            sys.exit(1)
+        batch = db.get_batch(batch_id)
+        print(f"\n{batch['label']}: {batch['total']} scanned, "
+              f"{batch['n_bad']} flagged, {batch['n_clean']} clean, "
+              f"{batch['n_unknown']} unknown, {batch['n_errors']} errors")
+
+    elif args.command == "retrain":
+        from . import db, registry, retrain
+
+        db.init_db()
+        registry.seed_registry()
+        record = retrain.train(args.role, epochs=args.epochs,
+                               auto_activate=not args.no_activate)
+        if record is None:
+            print("A training run is already in progress.")
+            sys.exit(1)
+        print(f"Registered {record['version']} at {record['path']}")
+
+    elif args.command == "models":
+        from . import db, registry
+
+        db.init_db()
+        registry.seed_registry()
+        for m in db.list_models():
+            active = " *ACTIVE*" if m["is_active"] else ""
+            print(f"[{m['id']:3d}] {m['version']:20s} {m['created_at'][:19]}{active}")
+            print(f"      {m['path']}")
+
+    elif args.command == "activate-model":
+        from . import db
+
+        db.init_db()
+        record = db.activate_model(args.model_id)
+        if record is None:
+            print(f"No model with id {args.model_id}")
+            sys.exit(1)
+        print(f"Activated {record['version']}")
 
     elif args.command == "analyze":
         import json

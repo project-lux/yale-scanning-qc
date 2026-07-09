@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "qc-app",
+      "runtimeExecutable": "uv",
+      "runtimeArgs": ["run", "yale-qc", "serve", "-p", "5057"],
+      "port": 5057
+    }
+  ]
+}

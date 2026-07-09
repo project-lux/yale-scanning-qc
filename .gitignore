@@ -184,3 +184,9 @@ cython_debug/
 .cursorignore
 .cursorindexingignore
 yolo26-obstruction.pt
+
+# Batch QC workflow artifacts
+data/qc.db*
+models/registry/
+data/datasets/
+runs/feedback/

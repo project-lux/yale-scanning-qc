@@ -1,28 +1,51 @@
-# Download pre-trained models from HuggingFace
-uv run yale-qc download-models
+# ============================================================
+# Yale Scanning QC — batch mode
+# ============================================================
+#
+# The app no longer watches folders in real time. Instead:
+#
+#   1. A daily scheduled pass (or "Run pass now" in the UI) sweeps the
+#      monitored directories for image files that have never been
+#      processed and records every result in a local SQLite database
+#      (data/qc.db).
+#   2. Each pass is a versioned batch ("pass-0001", "pass-0002", …)
+#      that records exactly which model versions it ran with, so a
+#      pass can be re-run after retraining and compared.
+#   3. A single binary YOLO26-nano classifier decides mistake /
+#      no_mistake per scan. A second classifier labels the page type
+#      (blank page / handwriting / photograph / typed text).
+#   4. Pages classified as handwriting are transcribed through either
+#      an SGLang server on an adjacent machine or Vertex AI Gemini
+#      (project cultural-heritage-gemini, gemini-3.1-flash-lite) —
+#      selectable in Settings.
+#   5. The next day, a reviewer works through flagged scans in the UI.
+#      Every verdict (Confirm Mistake / False Positive / Missed
+#      Mistake / Looks Good + page-type confirmation) is stored as a
+#      labeled training example.
+#   6. "Retrain from feedback" (Models page) fine-tunes a new model
+#      version from the accumulated verdicts, registers it with a
+#      version id (mistake-v002, …), and activates it — closing the
+#      reinforcement loop.
 
-# Download 5,000 images (seed 1337, max 1500px, 20 threads)
-uv run yale-qc download -n 5000
-
-# Augment for all QC categories
-uv run yale-qc augment
-
-# Prepare datasets for YOLO training
-uv run yale-qc prepare
-
-# Train all YOLO26 models
-uv run yale-qc train
-
-# Run the web app with green/red QC status lights
-uv run yale-qc serve
+# Run the web app (includes the daily scheduler)
 uv run yale-qc serve --host 0.0.0.0
+
+# Run one QC pass right now from the command line
+uv run yale-qc run-batch
+
+# Retrain the binary mistake model from reviewer feedback
+uv run yale-qc retrain --role mistake --epochs 50
+
+# Retrain the page-type model from confirmed page types
+uv run yale-qc retrain --role pagetype
+
+# List / activate registered model versions
+uv run yale-qc models
+uv run yale-qc activate-model 3
 
 # On macOS, find your LAN IP:
 ipconfig getifaddr en0    # WiFi
 ipconfig getifaddr en1    # Ethernet
-
-# Analyze a single image
-uv run yale-qc analyze path/to/image.jpg
 
 
 # ============================================================
