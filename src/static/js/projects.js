@@ -21,7 +21,7 @@
         : 'never';
       return `
         <div class="card ${p.enabled ? '' : 'off'}" data-id="${p.id}">
-          <h3>${esc(p.name)}</h3>
+          <h3><a href="/ff/project/${p.id}">${esc(p.name)}</a></h3>
           <div class="path" title="${esc(p.path)}">${esc(p.path)}</div>
           ${p.exists ? '' : '<div class="warnrow">Directory not reachable right now</div>'}
           <div class="nums">
@@ -32,6 +32,7 @@
           </div>
           <div class="path">Last pass: ${last}</div>
           <div class="acts">
+            <a class="btn sm primary" href="/ff/project/${p.id}">Open</a>
             <a class="btn sm" href="/ff/data?project=${p.id}">Training data</a>
             <button class="btn sm" data-act="rename">Rename</button>
             <button class="btn sm" data-act="toggle">${p.enabled ? 'Disable' : 'Enable'}</button>

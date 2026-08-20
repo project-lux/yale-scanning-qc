@@ -1,0 +1,115 @@
+{% extends "base.html" %}
+{% block title %}{{ project.name }} — Yale Scanning QC{% endblock %}
+
+{% block content %}
+<div id="projectRoot"
+     data-project-id="{{ project.id }}"
+     data-page-types="{{ page_types | join(',') }}">
+
+  <div class="pagehead">
+    <div>
+      <h1>{{ project.name }}</h1>
+      <p class="sub" title="{{ project.path }}">{{ project.path }}</p>
+    </div>
+    <div class="headactions">
+      <a class="btn" href="/ff/data?project={{ project.id }}">Training data</a>
+      <button class="btn" id="reprocessBtn">Reprocess…</button>
+      <button class="btn primary" id="runBtn">Run pass</button>
+    </div>
+  </div>
+
+  <section class="statbar" id="counts"></section>
+
+  <!-- Live progress while a pass or reprocess is running -->
+  <section class="runstrip" id="runstrip" hidden>
+    <span class="spinner"></span>
+    <strong id="runLabel">Working…</strong>
+    <span id="runDetail" class="hint"></span>
+    <div class="bar"><div class="barfill" id="runBar"></div></div>
+    <button class="btn sm" id="cancelBtn">Cancel</button>
+  </section>
+
+  <!-- Reprocess panel -->
+  <section class="filters" id="reprocessPanel" hidden>
+    <strong>Reprocess with the active models</strong>
+    <label class="check"><input type="checkbox" id="stBadscan" checked><span>Bad scan</span></label>
+    <label class="check"><input type="checkbox" id="stPagetype"><span>Page type</span></label>
+    <label class="check"><input type="checkbox" id="stTranscription"><span>Transcription</span></label>
+    <span class="grow"></span>
+    <span class="hint" id="reprocessScope">whole project</span>
+    <button class="btn sm primary" id="doReprocess">Start</button>
+    <button class="btn sm" id="cancelReprocess">Cancel</button>
+  </section>
+
+  <section class="filters">
+    <label class="field"><span>Model verdict</span>
+      <select id="fFlagged">
+        <option value="">All</option>
+        <option value="1">Flagged bad</option>
+        <option value="0">Clean</option>
+      </select></label>
+    <label class="field"><span>Review</span>
+      <select id="fReviewed">
+        <option value="">All</option>
+        <option value="0">Not reviewed</option>
+        <option value="1">Reviewed</option>
+      </select></label>
+    <label class="field"><span>Page type</span>
+      <select id="fPageType"><option value="">All</option></select></label>
+    <span class="grow"></span>
+    <label class="field"><span>Per page</span>
+      <select id="fPer"><option>60</option><option>120</option><option>240</option></select></label>
+  </section>
+
+  <section class="bulkbar" id="bulkbar" hidden>
+    <strong><span id="selCount">0</span> selected</strong>
+    <button class="btn sm" id="selAll">Select page</button>
+    <button class="btn sm" id="selNone">Clear</button>
+    <span class="grow"></span>
+    <button class="btn sm" id="bulkReprocess">Reprocess selected…</button>
+  </section>
+
+  <div class="grid" id="grid"></div>
+  <p class="empty" id="empty" hidden>No scans match these filters. Run a pass to process this directory.</p>
+  <div class="pager">
+    <button class="btn sm" id="prevPage">← Previous</button>
+    <span id="pageInfo">page 1</span>
+    <button class="btn sm" id="nextPage">Next →</button>
+  </div>
+</div>
+
+<!-- Review drawer -->
+<aside class="drawer" id="drawer" hidden aria-label="Scan detail">
+  <div class="drawerhead">
+    <strong id="dFilename">—</strong>
+    <button class="iconbtn" id="dClose" title="Close (Esc)">✕</button>
+  </div>
+  <div class="drawerbody">
+    <div class="dimgwrap"><img id="dImg" alt=""></div>
+    <div class="dmeta" id="dMeta"></div>
+
+    <fieldset class="dclasses">
+      <legend>Is this a bad scan? <span class="hint">b = bad, g = fine</span></legend>
+      <div class="labelbtns">
+        <button class="labelbtn" id="vBad">Bad scan <kbd>b</kbd></button>
+        <button class="labelbtn" id="vGood">Looks fine <kbd>g</kbd></button>
+      </div>
+      <p class="hint" id="verdictHint"></p>
+    </fieldset>
+
+    <label class="field block"><span>Page type</span>
+      <select id="dPageType"><option value="">— unchanged —</option></select></label>
+    <label class="field block"><span>Notes</span>
+      <textarea id="dNotes" rows="2" placeholder="What is wrong with it…"></textarea></label>
+
+    <div class="navrow">
+      <button class="btn sm" id="dPrev">← Prev (k)</button>
+      <button class="btn sm" id="dNext">Next (j) →</button>
+    </div>
+  </div>
+</aside>
+{% endblock %}
+
+{% block scripts %}
+<script src="{{ url_for('static', filename='js/project.js') }}"></script>
+{% endblock %}

@@ -474,6 +474,13 @@ def api_review_scan(scan_id: int):
         notes=(data.get("notes") or "").strip(),
         reviewer=session.get("user", ""),
     )
+    # Fold the verdict into the training-example store straight away so it
+    # is visible (and correctable) in the data browser without waiting for
+    # the next dataset build.
+    from . import examples as _examples
+    _examples.sync("badscan")
+    if page_type:
+        _examples.sync("pagetype")
     return jsonify({"scan": db.get_scan(scan_id)})
 
 

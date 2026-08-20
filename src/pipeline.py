@@ -138,7 +138,8 @@ def run_batch(trigger: str = "manual", directories: list[str] | None = None,
               rerun_of: int | None = None,
               badscan_model_id: int | None = None,
               pagetype_model_id: int | None = None,
-              paths: list[str] | None = None) -> int | None:
+              paths: list[str] | None = None,
+              project_id: int | None = None) -> int | None:
     """
     Run one QC pass. Returns the batch id, or None if a batch is already
     running. Blocking — call from a worker thread for the web app.
@@ -147,6 +148,8 @@ def run_batch(trigger: str = "manual", directories: list[str] | None = None,
     explicit ids runs the pass with those versions instead. *paths*
     restricts the pass to an explicit file list (bypassing the
     new-files-only filter) for folder- and image-level runs.
+    *project_id* attributes the pass to one project; when omitted it is
+    inferred from a single-directory *directories*.
     """
     if not _batch_lock.acquire(blocking=False):
         return None
@@ -174,6 +177,7 @@ def run_batch(trigger: str = "manual", directories: list[str] | None = None,
             pagetype_model_id=pagetype_model_id,
             transcription_backend=backend,
             rerun_of=rerun_of,
+            project_id=project_id,
         )
 
         work = _collect_work(directories, rerun_of, paths)

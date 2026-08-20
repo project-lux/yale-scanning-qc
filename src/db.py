@@ -403,16 +403,29 @@ def get_model(model_id: int) -> dict | None:
 
 def create_batch(trigger: str, directories: list[str],
                  badscan_model_id: int | None, pagetype_model_id: int | None,
-                 transcription_backend: str, rerun_of: int | None = None) -> int:
+                 transcription_backend: str, rerun_of: int | None = None,
+                 project_id: int | None = None) -> int:
+    """
+    Open a new pass. *project_id* scopes it to one project; when omitted it
+    is inferred from *directories* if they name exactly one known project,
+    so a single-directory pass is attributed without every caller changing.
+    """
     with _write_lock, get_db() as db:
+        if project_id is None and len(directories) == 1:
+            row = db.execute("SELECT id FROM projects WHERE path=?",
+                             (directories[0],)).fetchone()
+            if row:
+                project_id = row["id"]
         row = db.execute("SELECT COUNT(*) AS n FROM batches").fetchone()
         label = f"pass-{row['n'] + 1:04d}"
         cur = db.execute(
             "INSERT INTO batches (label, trigger, rerun_of, started_at, status, "
-            "badscan_model_id, pagetype_model_id, transcription_backend, directories) "
-            "VALUES (?, ?, ?, ?, 'running', ?, ?, ?, ?)",
+            "badscan_model_id, pagetype_model_id, transcription_backend, "
+            "directories, project_id) "
+            "VALUES (?, ?, ?, ?, 'running', ?, ?, ?, ?, ?)",
             (label, trigger, rerun_of, utcnow(), badscan_model_id,
-             pagetype_model_id, transcription_backend, json.dumps(directories)),
+             pagetype_model_id, transcription_backend, json.dumps(directories),
+             project_id),
         )
         return cur.lastrowid
 
@@ -1056,3 +1069,68 @@ def training_example_stats(role: str) -> dict:
         "inactive": agg["inactive"] or 0,
         "corrected": agg["corrected"] or 0,
     }
+
+
+def project_scans(project_id: int, flagged: bool | None = None,
+                  reviewed: bool | None = None, page_type: str | None = None,
+                  limit: int = 500, offset: int = 0) -> list[dict]:
+    """
+    Latest scan per file inside a project's directory, with any review.
+
+    This is the project detail grid. Only the newest pass per file is
+    returned, so re-running does not duplicate rows.
+    """
+    p = get_project(project_id)
+    if p is None:
+        return []
+    where = ["s.directory = ?"]
+    args: list = [p["path"]]
+    if flagged is True:
+        where.append("(s.bad_scan='bad_scan' OR r.verdict='false_negative')")
+    elif flagged is False:
+        where.append("s.bad_scan='no_bad_scan' AND r.verdict IS NULL")
+    if reviewed is True:
+        where.append("r.id IS NOT NULL")
+    elif reviewed is False:
+        where.append("r.id IS NULL")
+    if page_type:
+        where.append("s.page_type = ?")
+        args.append(page_type)
+
+    q = (
+        "SELECT s.*, b.label AS batch_label, b.started_at AS batch_started, "
+        " r.verdict AS review_verdict, r.page_type AS review_page_type, "
+        " r.notes AS review_notes "
+        "FROM scans s "
+        "JOIN (SELECT filepath, MAX(id) AS mid FROM scans GROUP BY filepath) t "
+        "  ON s.id = t.mid "
+        "JOIN batches b ON b.id = s.batch_id "
+        "LEFT JOIN reviews r ON r.scan_id = s.id "
+        "WHERE " + " AND ".join(where) +
+        " ORDER BY s.filename LIMIT ? OFFSET ?"
+    )
+    args += [limit, offset]
+    with get_db() as db:
+        return _rows(db.execute(q, args))
+
+
+def project_scan_counts(project_id: int) -> dict:
+    """Counts for the project grid's filter chips (latest pass per file)."""
+    p = get_project(project_id)
+    if p is None:
+        return {}
+    with get_db() as db:
+        row = db.execute(
+            "SELECT COUNT(*) total, "
+            " SUM(s.bad_scan='bad_scan') flagged, "
+            " SUM(s.bad_scan='no_bad_scan') clean, "
+            " SUM(s.bad_scan IS NULL) unknown, "
+            " SUM(r.id IS NOT NULL) reviewed, "
+            " SUM(s.status='error') errors, "
+            " SUM(s.transcription IS NOT NULL) transcribed "
+            "FROM scans s "
+            "JOIN (SELECT filepath, MAX(id) AS mid FROM scans GROUP BY filepath) t "
+            "  ON s.id = t.mid "
+            "LEFT JOIN reviews r ON r.scan_id = s.id "
+            "WHERE s.directory = ?", (p["path"],)).fetchone()
+    return {k: (row[k] or 0) for k in row.keys()}

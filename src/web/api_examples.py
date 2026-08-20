@@ -12,13 +12,9 @@ from flask import Blueprint, jsonify, request, send_file
 
 from .. import db, examples
 from ..config import MODEL_ROLES
+from . import thumbs
 
 bp = Blueprint("api_examples", __name__, url_prefix="/api/training-examples")
-
-# Grid thumbnails are generated once and cached; the originals are up to
-# 2500px and there can be hundreds on screen.
-THUMB_DIR = Path(__file__).resolve().parent.parent.parent / "data" / "thumbs"
-THUMB_SIDE = 320
 
 
 def _role() -> str:
@@ -104,22 +100,7 @@ def example_image(example_id: int):
 
     if _bool_arg("full", False):
         return send_file(src)
-
-    THUMB_DIR.mkdir(parents=True, exist_ok=True)
-    thumb = THUMB_DIR / f"{example_id}_{THUMB_SIDE}.jpg"
-    try:
-        if not thumb.exists() or thumb.stat().st_mtime < src.stat().st_mtime:
-            from PIL import Image
-
-            Image.MAX_IMAGE_PIXELS = None
-            with Image.open(src) as im:
-                im = im.convert("RGB")
-                im.thumbnail((THUMB_SIDE, THUMB_SIDE))
-                im.save(thumb, "JPEG", quality=82)
-        return send_file(thumb, mimetype="image/jpeg")
-    except Exception:
-        # A thumbnail is a convenience; fall back to the original.
-        return send_file(src)
+    return thumbs.serve("example", example_id, src)
 
 
 @bp.post("/<int:example_id>")
