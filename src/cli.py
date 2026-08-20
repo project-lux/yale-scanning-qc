@@ -6,6 +6,10 @@ import argparse
 import sys
 from pathlib import Path
 
+from dotenv import load_dotenv
+
+load_dotenv(Path(__file__).parent.parent / ".env")
+
 
 def main():
     parser = argparse.ArgumentParser(
@@ -92,6 +96,11 @@ Examples:
     rt_parser.add_argument("-e", "--epochs", type=int, default=50)
     rt_parser.add_argument("--no-activate", action="store_true",
                            help="Register the new version without activating it")
+
+    ts_parser = subparsers.add_parser("train-server",
+                                      help="Run the companion GPU train/infer server (on the remote box)")
+    ts_parser.add_argument("--host", default="0.0.0.0")
+    ts_parser.add_argument("--port", type=int, default=8100)
 
     subparsers.add_parser("models", help="List registered model versions")
 
@@ -220,6 +229,12 @@ Examples:
             print("A training run is already in progress.")
             sys.exit(1)
         print(f"Registered {record['version']} at {record['path']}")
+
+    elif args.command == "train-server":
+        import sys as _sys
+        from . import train_server
+        _sys.argv = ["train-server", "--host", args.host, "--port", str(args.port)]
+        train_server.main()
 
     elif args.command == "models":
         from . import db, registry

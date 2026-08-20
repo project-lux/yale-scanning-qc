@@ -186,14 +186,21 @@ def run_batch(trigger: str = "manual", directories: list[str] | None = None,
                     "current": "", "status": "running"}
         print(f"[batch {batch_id}] {trigger}: {len(work)} file(s) to process")
 
+        # Optional: batch the YOLO inference on the remote GPU box.
+        remote_preds = None
+        if work and _remote_inference_enabled():
+            remote_preds = _remote_infer_all(work, badscan_model_id, pagetype_model_id)
+
         cancelled = False
         for root, filepath in work:
             if _cancel.is_set():
                 cancelled = True
                 break
             progress["current"] = filepath.name
+            pre = remote_preds.get(str(filepath)) if remote_preds is not None else None
             _process_one(batch_id, root, filepath, transcribe_types, settings,
-                         badscan_model_id, pagetype_model_id)
+                         badscan_model_id, pagetype_model_id,
+                         remote_pre=pre, remote_mode=remote_preds is not None)
             progress["done"] += 1
 
         db.finish_batch(batch_id, status="cancelled" if cancelled else "done")
@@ -212,16 +219,23 @@ def run_batch(trigger: str = "manual", directories: list[str] | None = None,
 
 
 def classify_page_full(image, jp: Path, settings: dict,
-                       pagetype_model_id: int | None = None
+                       pagetype_model_id: int | None = None,
+                       precomputed: tuple | None = None
                        ) -> tuple[str | None, float, str]:
     """
     Page-type decision rule: the trained local model is authoritative for
     the normal (built-in) classes. The LLM endpoint is only used for
     custom classes the local model hasn't learned yet — or for everything
     while no trained local model is active at all.
+
+    *precomputed* is (class_or_None, conf) from remote inference; when
+    given, the model step is skipped and *image* is not used.
     Returns (page_type, confidence, source).
     """
-    page_type, page_conf = inference.classify_page(image, pagetype_model_id)
+    if precomputed is not None:
+        page_type, page_conf = precomputed
+    else:
+        page_type, page_conf = inference.classify_page(image, pagetype_model_id)
     page_source = "model" if page_type is not None else ""
 
     known = inference.model_classes("pagetype", pagetype_model_id) or set()
@@ -345,20 +359,101 @@ def _rerun_one(scan: dict, stages: set[str], settings: dict,
         return True
 
 
+def _remote_inference_enabled() -> bool:
+    from . import remote
+    if not remote.inference_enabled():
+        return False
+    if remote.reachable():
+        return True
+    print("  remote inference server unreachable — using local inference")
+    return False
+
+
+def _deployed_versions(badscan_model_id, pagetype_model_id) -> dict[str, str]:
+    """Ensure the chosen (and task-ready) models are on the remote; return role->version."""
+    from . import remote
+    out = {}
+    for role, mid in (("badscan", badscan_model_id), ("pagetype", pagetype_model_id)):
+        rec = db.get_model(mid) if mid else db.get_active_model(role)
+        if rec and inference.model_ready(role, rec["id"]) and Path(rec["path"]).exists():
+            try:
+                remote.ensure_model(rec["version"], Path(rec["path"]))
+                out[role] = rec["version"]
+            except Exception as e:
+                print(f"  remote deploy of {rec['version']} failed: {e}")
+    return out
+
+
+def _remote_infer_all(work: list, badscan_model_id, pagetype_model_id,
+                      chunk: int = 24) -> dict[str, dict]:
+    """
+    Batch-classify every work image on the remote box, keyed by filepath.
+    Reads each image once. Roles whose model isn't trained/deployed are
+    simply absent — the per-scan step then falls back (LLM for pagetype).
+    """
+    from . import remote
+
+    global progress
+    deployed = _deployed_versions(badscan_model_id, pagetype_model_id)
+    preds: dict[str, dict] = {}
+    if not deployed:
+        return preds  # nothing ready remotely; loop will handle locally/LLM
+
+    progress["status"] = "remote inference"
+    for i in range(0, len(work), chunk):
+        if _cancel.is_set():
+            break
+        batch = work[i:i + chunk]
+        imgs, paths = [], []
+        for root, fp in batch:
+            try:
+                jp = _ensure_jpeg(root, fp)
+                img = cv2.imread(str(jp))
+                if img is None:
+                    continue
+                imgs.append(img)
+                paths.append(str(fp))
+            except Exception:
+                continue
+        if not imgs:
+            continue
+        entry = {p: {} for p in paths}
+        for role, ver in deployed.items():
+            try:
+                res = remote.infer_batch(ver, imgs)
+                for p, r in zip(paths, res):
+                    entry[p][role] = (r.get("class"), float(r.get("conf") or 0.0))
+            except Exception as e:
+                print(f"  remote {role} inference failed on chunk: {e}")
+        preds.update(entry)
+        progress["done"] = min(len(work), i + len(batch))
+    progress["status"] = "running"
+    progress["done"] = 0
+    return preds
+
+
 def _process_one(batch_id: int, root: Path, filepath: Path,
                  transcribe_types: set[str], settings: dict,
                  badscan_model_id: int | None = None,
-                 pagetype_model_id: int | None = None) -> None:
+                 pagetype_model_id: int | None = None,
+                 remote_pre: dict | None = None, remote_mode: bool = False) -> None:
     directory = str(filepath.parent)
     try:
         jp = _ensure_jpeg(root, filepath)
-        image = cv2.imread(str(jp))
-        if image is None:
-            raise ValueError("Could not read image")
 
-        bad_scan, bad_scan_conf = inference.classify_badscan(image, badscan_model_id)
-        page_type, page_conf, page_source = classify_page_full(
-            image, jp, settings, pagetype_model_id)
+        if remote_mode:
+            pre = remote_pre or {}
+            bad_scan, bad_scan_conf = pre.get("badscan", (None, 0.0))
+            page_type, page_conf, page_source = classify_page_full(
+                None, jp, settings, pagetype_model_id,
+                precomputed=pre.get("pagetype", (None, 0.0)))
+        else:
+            image = cv2.imread(str(jp))
+            if image is None:
+                raise ValueError("Could not read image")
+            bad_scan, bad_scan_conf = inference.classify_badscan(image, badscan_model_id)
+            page_type, page_conf, page_source = classify_page_full(
+                image, jp, settings, pagetype_model_id)
 
         transcription, used_backend = None, ""
         if page_type in transcribe_types:

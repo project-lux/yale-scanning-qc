@@ -47,6 +47,32 @@ TRAIN_RUNS_DIR = PROJECT_ROOT / "runs" / "feedback"
 # Layout: <SYNTHETIC_DIR>/<role>/<label>/*.jpg — kept permanently and folded
 # into every dataset snapshot for that role.
 SYNTHETIC_DIR = DATA_DIR / "synthetic"
+# Curated real-world examples imported from outside the app (e.g. the legacy
+# reviewer verdicts harvested off the DSCA share). Same layout as
+# SYNTHETIC_DIR, but these are genuine human-labeled scans, so they are
+# tracked with source 'curated' rather than 'synthetic'.
+# Layout: <CURATED_DIR>/<role>/<label>/*.jpg
+CURATED_DIR = DATA_DIR / "curated"
+
+# ---------------------------------------------------------------------------
+# Remote GPU box (DGX Spark) — offloads training and/or batch inference.
+# Configured via .env; unset = everything runs locally.
+# ---------------------------------------------------------------------------
+import os as _os
+
+SPARK_IP = (_os.environ.get("SPARK_IP") or "").strip().strip('"')
+SPARK_PORT = (_os.environ.get("SPARK_PORT") or "8100").strip()
+SPARK_SSH_PORT = int((_os.environ.get("SPARK_SSH_PORT") or "22").strip())
+SPARK_USERNAME = (_os.environ.get("SPARK_USERNAME") or "").strip()
+SPARK_PASSWORD = (_os.environ.get("SPARK_PASSWORD") or "").strip()
+# Explicit URL override (direct reachability or a manually-run tunnel).
+# When SPARK_USERNAME/PASSWORD are set, the app opens its own SSH tunnel
+# instead and this is ignored.
+TRAIN_SERVER_URL = (_os.environ.get("TRAIN_SERVER_URL") or "").strip().rstrip("/")
+# Shared secret: TRAIN_SERVER_TOKEN preferred, falling back to SPARK_API_KEY.
+TRAIN_SERVER_TOKEN = ((_os.environ.get("TRAIN_SERVER_TOKEN") or "").strip()
+                      or (_os.environ.get("SPARK_API_KEY") or "").strip())
+REMOTE_INFERENCE = (_os.environ.get("REMOTE_INFERENCE") or "").strip().lower() in ("1", "true", "yes", "on")
 
 # Image types picked up by the batch pipeline
 SCAN_EXTENSIONS = {".tif", ".tiff", ".jpg", ".jpeg", ".png"}

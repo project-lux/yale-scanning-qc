@@ -13,6 +13,7 @@ Verdict -> label mapping:
 
 Additional example sources:
   badscan  — synthetic degraded images under SYNTHETIC_DIR/badscan/<label>/
+             plus curated real scans under CURATED_DIR/badscan/<label>/
   pagetype — unreviewed LLM-classified scans (weak bootstrap labels)
 
 Each retrain snapshots its examples into a versioned dataset (browsable
@@ -33,6 +34,7 @@ from . import db, inference, registry
 from .config import (
     BAD_SCAN_CLASSES,
     BADSCAN_BASE_WEIGHTS,
+    CURATED_DIR,
     DATASETS_DIR,
     PAGETYPE_BASE_WEIGHTS,
     SYNTHETIC_DIR,
@@ -42,6 +44,11 @@ from .config import (
 
 MIN_PER_CLASS = 4
 VAL_FRACTION = 0.15
+# Longest side kept when materializing a dataset. Training runs at imgsz=640,
+# so full 2500px archival derivatives are pure cost — they made the snapshot
+# ~528MB and timed out the upload to the remote trainer. 1024 keeps the
+# snapshot comfortably viewable in the dataset browser.
+MATERIALIZE_MAX_SIDE = 1024
 
 _train_lock = threading.Lock()
 progress: dict = {}
@@ -60,27 +67,37 @@ def is_running() -> bool:
 # Example collection
 # ---------------------------------------------------------------------------
 
-def _synthetic_examples(role: str) -> list[dict]:
-    """Pre-labeled images kept under SYNTHETIC_DIR/<role>/<label>/*."""
+def _dir_examples(base: Path, source: str) -> list[dict]:
+    """Pre-labeled images kept on disk under <base>/<label>/*."""
     out = []
-    base = SYNTHETIC_DIR / role
     if not base.is_dir():
         return out
-    for label_dir in base.iterdir():
-        if not label_dir.is_dir():
+    for label_dir in sorted(base.iterdir()):
+        if not label_dir.is_dir() or label_dir.name.startswith("_"):
             continue
-        for img in label_dir.iterdir():
+        for img in sorted(label_dir.iterdir()):
             if img.suffix.lower() in (".jpg", ".jpeg", ".png"):
                 out.append({"filepath": str(img), "jpeg_path": str(img),
-                            "label": label_dir.name, "source": "synthetic"})
+                            "label": label_dir.name, "source": source})
     return out
+
+
+def _synthetic_examples(role: str) -> list[dict]:
+    """Degraded/clean images manufactured by src.synth for *role*."""
+    return _dir_examples(SYNTHETIC_DIR / role, "synthetic")
+
+
+def _curated_examples(role: str) -> list[dict]:
+    """Real human-labeled scans imported from outside the app for *role*."""
+    return _dir_examples(CURATED_DIR / role, "curated")
 
 
 def _examples(role: str) -> list[dict]:
     if role == "badscan":
-        examples = db.labeled_badscan_examples() + _synthetic_examples("badscan")
+        examples = db.labeled_badscan_examples()
     else:
-        examples = db.labeled_pagetype_examples() + _synthetic_examples("pagetype")
+        examples = db.labeled_pagetype_examples()
+    examples += _synthetic_examples(role) + _curated_examples(role)
     # An example is only usable if its image still exists on disk.
     return [e for e in examples if e["jpeg_path"] and Path(e["jpeg_path"]).exists()]
 
@@ -121,6 +138,7 @@ def dataset_summary(role: str) -> dict:
         "human": sum(1 for e in examples if e.get("source") == "human"),
         "llm": sum(1 for e in examples if e.get("source") == "llm"),
         "synthetic": sum(1 for e in examples if e.get("source") == "synthetic"),
+        "curated": sum(1 for e in examples if e.get("source") == "curated"),
     }
 
 
@@ -174,8 +192,32 @@ def build_dataset(role: str, notes: str = "") -> dict:
     return db.get_dataset(ds_id)
 
 
+def _copy_scaled(src: Path, dest: Path) -> None:
+    """
+    Write *src* to *dest*, downscaling so its longest side is at most
+    MATERIALIZE_MAX_SIDE. Falls back to a plain copy if the image cannot be
+    decoded, so an odd file never breaks a whole dataset.
+    """
+    try:
+        from PIL import Image
+
+        Image.MAX_IMAGE_PIXELS = None
+        with Image.open(src) as im:
+            if max(im.size) <= MATERIALIZE_MAX_SIDE:
+                shutil.copy2(src, dest)
+                return
+            im = im.convert("RGB")
+            im.thumbnail((MATERIALIZE_MAX_SIDE, MATERIALIZE_MAX_SIDE))
+            im.save(dest, "JPEG", quality=90)
+    except Exception:
+        shutil.copy2(src, dest)
+
+
 def materialize_dataset(dataset_id: int) -> Path:
-    """Copy a dataset snapshot's items into an ultralytics classify layout."""
+    """
+    Copy a dataset snapshot's items into an ultralytics classify layout,
+    downscaled to MATERIALIZE_MAX_SIDE (see the constant for why).
+    """
     ds = db.get_dataset(dataset_id)
     if ds is None:
         raise ValueError(f"Dataset {dataset_id} not found")
@@ -188,13 +230,38 @@ def materialize_dataset(dataset_id: int) -> Path:
             continue
         dest = ds_dir / it["split"] / it["label"]
         dest.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(src, dest / f"{it['id']:06d}_{src.name}")
+        _copy_scaled(src, dest / f"{it['id']:06d}_{src.name}")
     return ds_dir
 
 
 # ---------------------------------------------------------------------------
 # Training
 # ---------------------------------------------------------------------------
+
+def _remote():
+    """
+    Return the remote client if a train server is configured AND reachable,
+    else None (so training gracefully runs locally when the box is down).
+    """
+    from . import remote
+    if remote.training_enabled() and remote.reachable():
+        return remote
+    if remote.training_enabled():
+        print("[retrain] remote train server unreachable — falling back to local")
+    return None
+
+
+def _deploy_to_remote(role: str, record: dict) -> None:
+    """Push a newly-activated model to the remote inference cache (best effort)."""
+    from . import remote
+    if not remote.inference_enabled():
+        return
+    try:
+        remote.deploy_model(record["version"], Path(record["path"]))
+        print(f"[retrain] deployed {record['version']} to remote inference")
+    except Exception as e:
+        print(f"[retrain] could not deploy {record['version']} to remote: {e}")
+
 
 def _base_weights(role: str) -> tuple[str, str]:
     """
@@ -237,41 +304,50 @@ def train(role: str, epochs: int = 50, auto_activate: bool = True,
 
         ds_dir = materialize_dataset(dataset_id)
         version = db.next_model_version(role)
-        progress = {"role": role, "version": version, "dataset": ds["version"],
-                    "epochs": epochs, "status": "training", "counts": ds_info["counts"]}
-        print(f"[retrain] {version} from {ds['version']}: {ds_info['counts']}")
-
         weights, base_name = _base_weights(role)
-        from ultralytics import YOLO
-
-        model = YOLO(weights)
-        results = model.train(
-            data=str(ds_dir),
-            epochs=epochs,
-            imgsz=640,
-            project=str(TRAIN_RUNS_DIR),
-            name=version,
-            exist_ok=True,
-            verbose=True,
-        )
-
-        best = Path(results.save_dir) / "weights" / "best.pt"
-        if not best.exists():
-            raise RuntimeError(f"Training produced no weights at {best}")
+        remote = _remote()
 
         metrics = {"dataset": ds_info, "epochs": epochs, "dataset_version": ds["version"]}
-        try:
-            metrics["top1_accuracy"] = float(results.results_dict.get("metrics/accuracy_top1", 0))
-        except Exception:
-            pass
+        where = "remote" if (remote and remote.training_enabled()) else "local"
+        progress = {"role": role, "version": version, "dataset": ds["version"],
+                    "epochs": epochs, "status": "training", "where": where,
+                    "counts": ds_info["counts"]}
+        print(f"[retrain] {version} from {ds['version']} ({where}): {ds_info['counts']}")
+
+        if where == "remote":
+            def _cb(st):
+                progress.update(epoch=st.get("epoch"), remote_status=st.get("status"))
+            best, remote_metrics = remote.train_remote(
+                ds_dir, Path(weights),
+                {"role": role, "version": version, "classes": _role_classes(role, _examples(role)),
+                 "epochs": epochs, "imgsz": 640},
+                progress_cb=_cb,
+            )
+            metrics.update(remote_metrics)
+        else:
+            from ultralytics import YOLO
+
+            model = YOLO(weights)
+            results = model.train(
+                data=str(ds_dir), epochs=epochs, imgsz=640,
+                project=str(TRAIN_RUNS_DIR), name=version, exist_ok=True, verbose=True,
+            )
+            best = Path(results.save_dir) / "weights" / "best.pt"
+            if not best.exists():
+                raise RuntimeError(f"Training produced no weights at {best}")
+            try:
+                metrics["top1_accuracy"] = float(results.results_dict.get("metrics/accuracy_top1", 0))
+            except Exception:
+                pass
 
         record = registry.register_version(
             role, best, base_model=base_name, metrics=metrics,
-            notes=f"Trained on {ds['version']} ({ds_info['total']} examples).",
+            notes=f"Trained on {ds['version']} ({ds_info['total']} examples, {where}).",
             activate=auto_activate,
         )
         if auto_activate:
             inference.invalidate_cache()
+            _deploy_to_remote(role, record)
 
         db.finish_training_run(run_id, "done", model_id=record["id"])
         progress = {}

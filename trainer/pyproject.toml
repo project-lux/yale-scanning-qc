@@ -1,0 +1,10 @@
+[project]
+name = "yale-qc-trainer"
+version = "0.1.0"
+description = "Yale Scanning QC companion train/infer server (runs on the GPU box)"
+requires-python = ">=3.10"
+dependencies = [
+    "flask>=3.0.0",
+    "ultralytics>=8.4.0",
+    "opencv-python-headless>=4.9.0",
+]

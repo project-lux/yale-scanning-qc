@@ -152,7 +152,7 @@ def index():
 
 @app.route("/api/state")
 def api_state():
-    from . import inference
+    from . import inference, remote
     settings = db.get_settings()
     return jsonify({
         "settings": settings,
@@ -169,6 +169,7 @@ def api_state():
         "batch_progress": pipeline.progress,
         "train_running": retrain.is_running(),
         "train_progress": retrain.progress,
+        "remote": remote.status(),
         "next_scheduled": scheduler.next_run_description(),
         "page_types": all_page_types(settings),
         "builtin_page_types": PAGE_TYPES,
@@ -532,6 +533,12 @@ def api_train():
 @app.route("/api/datasets", methods=["GET"])
 def api_datasets():
     return jsonify({"datasets": db.list_datasets()})
+
+
+@app.route("/api/remote/status")
+def api_remote_status():
+    from . import remote
+    return jsonify(remote.status(refresh=True))
 
 
 @app.route("/api/synthetic/badscan", methods=["POST"])
@@ -1579,8 +1586,14 @@ function renderRunStrip(){
         btn.onclick = cancelRunningBatch;
     } else if(state.train_running){
         const tp = state.train_progress || {};
-        txt.textContent = 'Training ' + (tp.version || tp.role || 'model') + '…';
-        bar.style.display = 'none';
+        const where = tp.where === 'remote' ? ' on GPU box' : tp.where === 'local' ? ' locally' : '';
+        let msg = 'Training ' + (tp.version || tp.role || 'model') + where;
+        if(tp.status === 'materializing') msg += ' · preparing dataset';
+        else if(tp.epoch && tp.epochs) msg += ' · epoch ' + tp.epoch + '/' + tp.epochs;
+        else if(tp.status) msg += ' · ' + tp.status;
+        txt.textContent = msg + '…';
+        bar.style.display = tp.epoch && tp.epochs ? 'block' : 'none';
+        if(tp.epoch && tp.epochs) fill.style.width = Math.round(100 * tp.epoch / tp.epochs) + '%';
         btn.disabled = true;
         btn.textContent = 'New pass…';
         btn.classList.remove('cancel');
@@ -1592,6 +1605,26 @@ function renderRunStrip(){
         btn.classList.remove('cancel');
         btn.onclick = openRunModal;
     }
+    renderRemoteStrip();
+}
+
+function renderRemoteStrip(){
+    let el = $('#remoteStrip');
+    const r = state && state.remote;
+    if(!r || !r.enabled){ if(el) el.style.display = 'none'; return; }
+    if(!el){
+        el = document.createElement('div');
+        el.id = 'remoteStrip';
+        el.style.cssText = 'font-size:.66rem;margin-top:.45rem;opacity:.8;display:flex;align-items:center;gap:.4rem';
+        $('#runStrip').appendChild(el);
+    }
+    el.style.display = 'flex';
+    const dot = r.reachable ? '#8cc63f' : '#e04040';
+    const label = r.reachable
+        ? 'GPU: ' + (r.gpu || 'connected') + (r.inference ? ' · inference on' : '')
+        : 'GPU box offline';
+    el.innerHTML = '<span style="width:7px;height:7px;border-radius:50%;background:' + dot + ';flex-shrink:0"></span>'
+        + '<span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + esc(label) + '</span>';
 }
 
 async function cancelRunningBatch(){
@@ -1859,7 +1892,7 @@ async function renderDatasetsView(){
     [['badscan','Bad-scan'],['pagetype','Page-type']].forEach(([role, title]) => {
         const ds = (d.datasets || {})[role] || {counts:{}, total:0, trainable:false, min_per_class:4};
         const countsStr = Object.entries(ds.counts).map(([k,v]) => esc(k)+': <b>'+v+'</b>').join(' · ') || 'none';
-        const srcStr = [ds.human?ds.human+' reviewed':'', ds.llm?ds.llm+' LLM':'', ds.synthetic?ds.synthetic+' synthetic':'']
+        const srcStr = [ds.human?ds.human+' reviewed':'', ds.curated?ds.curated+' curated':'', ds.llm?ds.llm+' LLM':'', ds.synthetic?ds.synthetic+' synthetic':'']
             .filter(Boolean).join(', ');
         html += '<div class="panel"><h2>' + title + ' dataset'
             + '<span class="spacer"></span>'
@@ -2734,7 +2767,7 @@ async function renderModelsView(){
     try { d = await api('/api/models'); } catch(e){ content.innerHTML = '<div class="panel">' + esc(e.message) + '</div>'; return; }
 
     const roles = [
-        {role:'badscan', title:'Bad-scan model (binary)', sub:'yolo26-nano classifier: bad_scan / no_bad_scan. Trained on ALL reviewer verdicts — confirmed and missed bad scans count as "bad_scan"; false positives and confirmed-clean count as "no_bad_scan" — plus any synthetic degraded examples. Retraining always runs over the full accumulated set (dataset aggregation, not per-flag).'},
+        {role:'badscan', title:'Bad-scan model (binary)', sub:'yolo26-nano classifier: bad_scan / no_bad_scan. Trained on ALL reviewer verdicts — confirmed and missed bad scans count as "bad_scan"; false positives and confirmed-clean count as "no_bad_scan" — plus curated real scans imported from the share and any synthetic degraded examples. Retraining always runs over the full accumulated set (dataset aggregation, not per-flag).'},
         {role:'pagetype', title:'Page-type model', sub:'Classifier: blank page / handwriting / photograph / typed text, plus any custom classes from Settings. Trains on page types you confirm during review AND on unreviewed LLM labels (weak bootstrap — your confirmations always override them). Once trained, the local model handles its classes and the LLM is only used for custom classes it has not learned yet.'},
     ];
 
@@ -2849,8 +2882,28 @@ async function renderSettingsView(){
     });
 
     const backend = s.transcription_backend || 'off';
+    const rem = state.remote || {enabled:false};
+    let remHtml;
+    if(!rem.enabled){
+        remHtml = '<div class="panel-sub">Not configured. Set SPARK_IP + SPARK_USERNAME + SPARK_PASSWORD (and TRAIN_SERVER_TOKEN) in .env to offload training/inference to the GPU box; the app opens its own SSH tunnel.</div>';
+    } else {
+        const dot = rem.reachable ? 'var(--green)' : 'var(--red)';
+        remHtml = '<div class="set-row" style="gap:.5rem;margin-bottom:.5rem"><span style="width:9px;height:9px;border-radius:50%;background:' + dot + '"></span>'
+            + '<b>' + (rem.reachable ? 'Connected' : 'Offline') + '</b>'
+            + (rem.host ? ' <span class="panel-sub" style="margin:0">' + esc(rem.host) + (rem.use_tunnel ? ' (SSH tunnel)' : '') + '</span>' : '') + '</div>'
+            + (rem.reachable
+                ? '<div class="panel-sub">GPU: <b>' + esc(rem.gpu || '?') + '</b> · CUDA ' + (rem.cuda ? 'yes' : 'no')
+                  + ' · models loaded: ' + ((rem.loaded_models||[]).join(', ') || 'none')
+                  + '<br>Batch inference: <b>' + (rem.inference ? 'ON' : 'off') + '</b> (REMOTE_INFERENCE in .env) · training offloads automatically when connected.</div>'
+                : '<div class="panel-sub" style="color:var(--red)">' + esc(rem.error || 'cannot reach server') + '</div>');
+    }
+
     content.innerHTML = ''
     + '<div class="set-grid">'
+
+    + '<div class="panel"><h2>GPU box (remote training &amp; inference)'
+    + '<span class="spacer"></span><button class="mini-btn" onclick="testRemote()">Test connection</button></h2>'
+    + '<div id="remoteStatusBox">' + remHtml + '</div></div>'
 
     + '<div class="panel"><h2>Monitored directories</h2>'
     + '<div class="panel-sub">Each pass sweeps these folders <b>and all their subfolders</b> for image files (' + Array.from(['tif','tiff','jpg','jpeg','png']).join(', ') + ') that have not been processed before. The qc/ cache folder is excluded.</div>'
@@ -2929,6 +2982,16 @@ window.saveSettings = async function(){
             if(el){ el.style.display = 'inline'; setTimeout(() => el.style.display = 'none', 2000); }
         });
     } catch(e){ alert(e.message); }
+};
+
+window.testRemote = async function(){
+    const box = document.getElementById('remoteStatusBox');
+    if(box) box.innerHTML = '<div class="panel-sub">Testing…</div>';
+    try {
+        await api('/api/remote/status');
+        await refreshState();
+    } catch(e){}
+    renderSettingsView();
 };
 
 window.addDir = async function(){
