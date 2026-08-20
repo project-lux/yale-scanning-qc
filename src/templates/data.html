@@ -1,0 +1,111 @@
+{% extends "base.html" %}
+{% block title %}Training data — Yale Scanning QC{% endblock %}
+
+{% block content %}
+<div class="datapage" id="datapage">
+
+  <div class="pagehead">
+    <div>
+      <h1>Training data</h1>
+      <p class="sub">Every labeled image the next model will learn from. Click one to
+        see and change its class.</p>
+    </div>
+    <div class="headactions">
+      <label class="field">
+        <span>Model</span>
+        <select id="roleSel">
+          {% for r in roles %}<option value="{{ r }}">{{ r }}</option>{% endfor %}
+        </select>
+      </label>
+      <button class="btn" id="syncBtn" title="Scan every source for new labeled images">Sync sources</button>
+    </div>
+  </div>
+
+  <!-- Label / source composition -->
+  <section class="statbar" id="statbar" aria-live="polite"></section>
+
+  <!-- Filters -->
+  <section class="filters">
+    <label class="field"><span>Class</span>
+      <select id="fLabel"><option value="">All</option></select></label>
+    <label class="field"><span>Source</span>
+      <select id="fSource"><option value="">All</option></select></label>
+    <label class="field"><span>Project</span>
+      <select id="fProject">
+        <option value="">All</option>
+        {% for p in projects %}<option value="{{ p.id }}">{{ p.name }}</option>{% endfor %}
+      </select></label>
+    <label class="field"><span>Status</span>
+      <select id="fActive">
+        <option value="1">In training</option>
+        <option value="0">Excluded</option>
+      </select></label>
+    <label class="check"><input type="checkbox" id="fCorrected">
+      <span>Corrected only</span></label>
+    <label class="check"><input type="checkbox" id="fMissing">
+      <span>Missing file</span></label>
+    <span class="grow"></span>
+    <label class="field"><span>Per page</span>
+      <select id="fPer">
+        <option>60</option><option>120</option><option>240</option>
+      </select></label>
+  </section>
+
+  <!-- Bulk actions, shown only with a selection -->
+  <section class="bulkbar" id="bulkbar" hidden>
+    <strong><span id="selCount">0</span> selected</strong>
+    <button class="btn sm" id="selAll">Select page</button>
+    <button class="btn sm" id="selNone">Clear</button>
+    <span class="grow"></span>
+    <label class="field inline"><span>Set class</span>
+      <select id="bulkLabel"><option value="">—</option></select></label>
+    <button class="btn sm" id="bulkExclude">Exclude</button>
+    <button class="btn sm" id="bulkRestore">Restore</button>
+    <button class="btn sm danger" id="bulkDelete">Delete…</button>
+  </section>
+
+  <div class="gridwrap">
+    <div class="grid" id="grid"></div>
+    <p class="empty" id="empty" hidden>Nothing matches these filters.</p>
+    <div class="pager">
+      <button class="btn sm" id="prevPage">← Previous</button>
+      <span id="pageInfo">page 1</span>
+      <button class="btn sm" id="nextPage">Next →</button>
+    </div>
+  </div>
+</div>
+
+<!-- Detail drawer -->
+<aside class="drawer" id="drawer" hidden aria-label="Example detail">
+  <div class="drawerhead">
+    <strong id="dFilename">—</strong>
+    <button class="iconbtn" id="dClose" title="Close (Esc)">✕</button>
+  </div>
+  <div class="drawerbody">
+    <div class="dimgwrap"><img id="dImg" alt="" ></div>
+    <div class="dmeta" id="dMeta"></div>
+
+    <fieldset class="dclasses">
+      <legend>Class <span class="hint">press 1–9</span></legend>
+      <div id="dLabels" class="labelbtns"></div>
+    </fieldset>
+
+    <label class="field block"><span>Notes</span>
+      <textarea id="dNotes" rows="3" placeholder="Why this label…"></textarea></label>
+
+    <div class="drawerActions">
+      <button class="btn" id="dSave">Save notes</button>
+      <button class="btn" id="dToggle">Exclude</button>
+      <button class="btn danger" id="dDelete">Delete…</button>
+    </div>
+    <div class="navrow">
+      <button class="btn sm" id="dPrev">← Prev (k)</button>
+      <button class="btn sm" id="dNext">Next (j) →</button>
+    </div>
+  </div>
+</aside>
+{% endblock %}
+
+{% block scripts %}
+<script src="{{ url_for('static', filename='js/data.js') }}"></script>
+{% endblock %}

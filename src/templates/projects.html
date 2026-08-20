@@ -1,0 +1,23 @@
+{% extends "base.html" %}
+{% block title %}Projects — Yale Scanning QC{% endblock %}
+
+{% block content %}
+<div class="pagehead">
+  <div>
+    <h1>Projects</h1>
+    <p class="sub">Each monitored directory is its own project. Models and datasets
+      are shared across all of them.</p>
+  </div>
+  <div class="headactions">
+    <input id="newPath" class="input wide" placeholder="/path/to/scans">
+    <button class="btn primary" id="addBtn">Add project</button>
+  </div>
+</div>
+
+<div class="cards" id="cards"></div>
+<p class="empty" id="empty" hidden>No projects yet. Add a directory above.</p>
+{% endblock %}
+
+{% block scripts %}
+<script src="{{ url_for('static', filename='js/projects.js') }}"></script>
+{% endblock %}

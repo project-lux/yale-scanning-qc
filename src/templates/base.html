@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}Yale Scanning QC{% endblock %}</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/app.css') }}">
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="{{ url_for('views.home') }}">Yale Scanning QC</a>
+    <nav class="mainnav">
+      <a href="{{ url_for('views.home') }}"
+         class="{{ 'on' if active_nav == 'projects' }}">Projects</a>
+      <a href="{{ url_for('views.data_browser') }}"
+         class="{{ 'on' if active_nav == 'data' }}">Training data</a>
+      <a href="/">Classic UI</a>
+    </nav>
+  </header>
+
+  <main class="page">
+    {% block content %}{% endblock %}
+  </main>
+
+  <div id="toast" class="toast" hidden></div>
+  <script src="{{ url_for('static', filename='js/common.js') }}"></script>
+  {% block scripts %}{% endblock %}
+</body>
+</html>

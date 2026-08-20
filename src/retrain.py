@@ -11,10 +11,11 @@ Verdict -> label mapping:
                   false_positive / true_negative  -> "no_bad_scan"
   pagetype role — the reviewer-confirmed page type
 
-Additional example sources:
-  badscan  — synthetic degraded images under SYNTHETIC_DIR/badscan/<label>/
-             plus curated real scans under CURATED_DIR/badscan/<label>/
-  pagetype — unreviewed LLM-classified scans (weak bootstrap labels)
+Examples no longer come from disk layout or from re-deriving reviews on
+every build. :mod:`src.examples` owns the ``training_examples`` table, which
+is synced from every source (reviewer verdicts, curated imports, synthetic
+positives, LLM page types) and is editable in the app — so a corrected or
+deactivated label is honoured here without any special-casing.
 
 Each retrain snapshots its examples into a versioned dataset (browsable
 and reproducible in the app), materializes them to an ultralytics
@@ -30,14 +31,12 @@ import traceback
 from collections import Counter
 from pathlib import Path
 
-from . import db, inference, registry
+from . import db, examples, inference, registry
 from .config import (
     BAD_SCAN_CLASSES,
     BADSCAN_BASE_WEIGHTS,
-    CURATED_DIR,
     DATASETS_DIR,
     PAGETYPE_BASE_WEIGHTS,
-    SYNTHETIC_DIR,
     TRAIN_RUNS_DIR,
     all_page_types,
 )
@@ -67,39 +66,14 @@ def is_running() -> bool:
 # Example collection
 # ---------------------------------------------------------------------------
 
-def _dir_examples(base: Path, source: str) -> list[dict]:
-    """Pre-labeled images kept on disk under <base>/<label>/*."""
-    out = []
-    if not base.is_dir():
-        return out
-    for label_dir in sorted(base.iterdir()):
-        if not label_dir.is_dir() or label_dir.name.startswith("_"):
-            continue
-        for img in sorted(label_dir.iterdir()):
-            if img.suffix.lower() in (".jpg", ".jpeg", ".png"):
-                out.append({"filepath": str(img), "jpeg_path": str(img),
-                            "label": label_dir.name, "source": source})
-    return out
-
-
-def _synthetic_examples(role: str) -> list[dict]:
-    """Degraded/clean images manufactured by src.synth for *role*."""
-    return _dir_examples(SYNTHETIC_DIR / role, "synthetic")
-
-
-def _curated_examples(role: str) -> list[dict]:
-    """Real human-labeled scans imported from outside the app for *role*."""
-    return _dir_examples(CURATED_DIR / role, "curated")
-
-
 def _examples(role: str) -> list[dict]:
-    if role == "badscan":
-        examples = db.labeled_badscan_examples()
-    else:
-        examples = db.labeled_pagetype_examples()
-    examples += _synthetic_examples(role) + _curated_examples(role)
-    # An example is only usable if its image still exists on disk.
-    return [e for e in examples if e["jpeg_path"] and Path(e["jpeg_path"]).exists()]
+    """
+    Active, on-disk examples for *role*. Syncing first means files or
+    verdicts added since the last build are picked up, while corrections
+    already recorded in the store are preserved (sync is insert-only).
+    """
+    examples.sync(role)
+    return examples.for_training(role)
 
 
 def _role_classes(role: str, examples: list[dict]) -> list[str]:
@@ -130,15 +104,21 @@ def dataset_summary(role: str) -> dict:
             display.setdefault(c, n)
         trainable = len(_role_classes(role, examples)) >= 2
 
+    by_source: Counter = Counter(e.get("source", "") for e in examples)
+    store = db.training_example_stats(role)
     return {
         "counts": display,
         "total": len(examples),
         "trainable": trainable,
         "min_per_class": MIN_PER_CLASS,
-        "human": sum(1 for e in examples if e.get("source") == "human"),
-        "llm": sum(1 for e in examples if e.get("source") == "llm"),
-        "synthetic": sum(1 for e in examples if e.get("source") == "synthetic"),
-        "curated": sum(1 for e in examples if e.get("source") == "curated"),
+        "by_source": dict(by_source),
+        # Kept as flat keys for the existing dataset panel.
+        "human": by_source.get("human", 0),
+        "llm": by_source.get("llm", 0),
+        "synthetic": by_source.get("synthetic", 0),
+        "curated": by_source.get("curated", 0),
+        "corrected": store.get("corrected", 0),
+        "excluded": store.get("inactive", 0),
     }
 
 

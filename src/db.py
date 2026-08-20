@@ -4,6 +4,16 @@ SQLite persistence for the batch QC workflow.
 Everything the pipeline produces (batches, per-scan predictions,
 transcriptions) and everything the reviewer decides (reviews) is stored
 here so it can be exported as training data for the next model version.
+
+Two tables carry the project-centric ("freeflow") model:
+
+  projects          — one per monitored directory. Each directory is its own
+                      project; models and datasets stay global and shared.
+  training_examples — every labeled image as a first-class, editable row.
+                      Previously a label was implied by which folder a file
+                      sat in (data/curated/<role>/<label>/), so it could not
+                      be inspected or corrected in the app. Now the row owns
+                      the label and the file is just storage.
 """
 
 import json
@@ -22,6 +32,40 @@ CREATE TABLE IF NOT EXISTS settings (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL DEFAULT ''
 );
+
+CREATE TABLE IF NOT EXISTS projects (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    name       TEXT NOT NULL,
+    path       TEXT NOT NULL UNIQUE,
+    enabled    INTEGER NOT NULL DEFAULT 1,
+    notes      TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL
+);
+
+-- One row per labeled image. `label` is the live, correctable class;
+-- `original_label` keeps what it was imported as, so a correction is
+-- visible rather than silently overwriting provenance. `active=0` is a
+-- soft delete: the row is excluded from new datasets but stays
+-- inspectable and restorable.
+CREATE TABLE IF NOT EXISTS training_examples (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    role           TEXT NOT NULL,              -- 'badscan' | 'pagetype'
+    label          TEXT NOT NULL,
+    original_label TEXT NOT NULL DEFAULT '',
+    source         TEXT NOT NULL,              -- human | curated | synthetic | llm
+    image_path     TEXT NOT NULL,
+    project_id     INTEGER REFERENCES projects(id),
+    scan_id        INTEGER REFERENCES scans(id),
+    origin_ref     TEXT NOT NULL DEFAULT '',   -- verdict json, defect kind, …
+    notes          TEXT NOT NULL DEFAULT '',
+    active         INTEGER NOT NULL DEFAULT 1,
+    created_at     TEXT NOT NULL,
+    updated_at     TEXT NOT NULL,
+    UNIQUE(role, image_path)
+);
+CREATE INDEX IF NOT EXISTS idx_texamples_role   ON training_examples(role, active);
+CREATE INDEX IF NOT EXISTS idx_texamples_label  ON training_examples(role, label);
+CREATE INDEX IF NOT EXISTS idx_texamples_proj   ON training_examples(project_id);
 
 CREATE TABLE IF NOT EXISTS directories (
     id       INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -173,6 +217,11 @@ def init_db() -> None:
             db.execute("ALTER TABLE training_runs ADD COLUMN dataset_id INTEGER")
         except sqlite3.OperationalError:
             pass
+        # Batches become project-scoped; existing rows are backfilled below.
+        try:
+            db.execute("ALTER TABLE batches ADD COLUMN project_id INTEGER REFERENCES projects(id)")
+        except sqlite3.OperationalError:
+            pass
 
         # --- mistake -> bad_scan rename migration ---
         scan_cols = _columns(db, "scans")
@@ -190,6 +239,34 @@ def init_db() -> None:
         db.execute("DELETE FROM models WHERE role='mistake'")
         db.execute("UPDATE datasets SET role='badscan' WHERE role='mistake'")
         db.execute("UPDATE training_runs SET role='badscan' WHERE role='mistake'")
+
+        # --- directories -> projects ---
+        # The legacy `directories` table is left in place (harmless, unused)
+        # so an older checkout can still read this DB.
+        for d in db.execute("SELECT path, enabled, added_at FROM directories").fetchall():
+            db.execute(
+                "INSERT OR IGNORE INTO projects (name, path, enabled, created_at) "
+                "VALUES (?, ?, ?, ?)",
+                (Path(d["path"]).name or d["path"], d["path"], d["enabled"],
+                 d["added_at"] or utcnow()),
+            )
+
+        # Attach existing batches to a project when their directory list names
+        # exactly one known project; ambiguous multi-directory passes stay NULL
+        # rather than being arbitrarily assigned.
+        proj_by_path = {r["path"]: r["id"]
+                        for r in db.execute("SELECT id, path FROM projects")}
+        for b in db.execute(
+            "SELECT id, directories FROM batches WHERE project_id IS NULL"
+        ).fetchall():
+            try:
+                dirs = json.loads(b["directories"] or "[]")
+            except Exception:
+                continue
+            ids = {proj_by_path[d] for d in dirs if d in proj_by_path}
+            if len(ids) == 1:
+                db.execute("UPDATE batches SET project_id=? WHERE id=?",
+                           (ids.pop(), b["id"]))
 
         for key, value in DEFAULT_SETTINGS.items():
             db.execute(
@@ -728,3 +805,254 @@ def delete_dataset(dataset_id: int) -> None:
     with _write_lock, get_db() as db:
         db.execute("DELETE FROM dataset_items WHERE dataset_id=?", (dataset_id,))
         db.execute("DELETE FROM datasets WHERE id=?", (dataset_id,))
+
+
+# ---------------------------------------------------------------------------
+# Projects (one per monitored directory)
+# ---------------------------------------------------------------------------
+
+def list_projects(enabled_only: bool = False) -> list[dict]:
+    q = "SELECT * FROM projects"
+    if enabled_only:
+        q += " WHERE enabled=1"
+    q += " ORDER BY name COLLATE NOCASE"
+    with get_db() as db:
+        return _rows(db.execute(q))
+
+
+def get_project(project_id: int) -> dict | None:
+    with get_db() as db:
+        row = db.execute("SELECT * FROM projects WHERE id=?", (project_id,)).fetchone()
+        return dict(row) if row else None
+
+
+def get_project_by_path(path: str) -> dict | None:
+    with get_db() as db:
+        row = db.execute("SELECT * FROM projects WHERE path=?", (str(path),)).fetchone()
+        return dict(row) if row else None
+
+
+def add_project(path: str, name: str = "") -> dict:
+    path = str(path)
+    with _write_lock, get_db() as db:
+        db.execute(
+            "INSERT OR IGNORE INTO projects (name, path, enabled, created_at) "
+            "VALUES (?, ?, 1, ?)",
+            (name or Path(path).name or path, path, utcnow()),
+        )
+    return get_project_by_path(path)
+
+
+def update_project(project_id: int, **fields) -> None:
+    allowed = {"name", "notes", "enabled"}
+    sets = {k: v for k, v in fields.items() if k in allowed}
+    if not sets:
+        return
+    cols = ", ".join(f"{k}=?" for k in sets)
+    with _write_lock, get_db() as db:
+        db.execute(f"UPDATE projects SET {cols} WHERE id=?",
+                   (*sets.values(), project_id))
+
+
+def remove_project(project_id: int) -> None:
+    """Forget a project. Scans/batches keep their rows so history survives."""
+    with _write_lock, get_db() as db:
+        db.execute("UPDATE training_examples SET project_id=NULL WHERE project_id=?",
+                   (project_id,))
+        db.execute("DELETE FROM projects WHERE id=?", (project_id,))
+
+
+def project_stats(project_id: int) -> dict:
+    """Counts the project list needs, in one pass per table."""
+    p = get_project(project_id)
+    if p is None:
+        return {}
+    with get_db() as db:
+        scans = db.execute(
+            "SELECT COUNT(*) n, "
+            "SUM(bad_scan='bad_scan') n_bad, "
+            "SUM(bad_scan IS NULL) n_unknown "
+            "FROM scans WHERE directory=?", (p["path"],)
+        ).fetchone()
+        reviewed = db.execute(
+            "SELECT COUNT(*) n FROM reviews r JOIN scans s ON s.id=r.scan_id "
+            "WHERE s.directory=?", (p["path"],)
+        ).fetchone()
+        examples = db.execute(
+            "SELECT COUNT(*) n FROM training_examples "
+            "WHERE project_id=? AND active=1", (project_id,)
+        ).fetchone()
+        last = db.execute(
+            "SELECT label, started_at, status FROM batches WHERE project_id=? "
+            "ORDER BY id DESC LIMIT 1", (project_id,)
+        ).fetchone()
+    return {
+        "n_scans": scans["n"] or 0,
+        "n_bad": scans["n_bad"] or 0,
+        "n_unknown": scans["n_unknown"] or 0,
+        "n_reviewed": reviewed["n"] or 0,
+        "n_examples": examples["n"] or 0,
+        "last_batch": dict(last) if last else None,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Training examples — editable, first-class labeled images
+# ---------------------------------------------------------------------------
+
+def add_training_example(role: str, label: str, source: str, image_path: str,
+                         project_id: int | None = None, scan_id: int | None = None,
+                         origin_ref: str = "", notes: str = "") -> int | None:
+    """
+    Insert one labeled image. Returns its id, or None if this (role,
+    image_path) is already present — re-imports never clobber a label the
+    reviewer has since corrected.
+    """
+    now = utcnow()
+    with _write_lock, get_db() as db:
+        cur = db.execute(
+            "INSERT OR IGNORE INTO training_examples "
+            "(role, label, original_label, source, image_path, project_id, "
+            " scan_id, origin_ref, notes, active, created_at, updated_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,1,?,?)",
+            (role, label, label, source, str(image_path), project_id, scan_id,
+             origin_ref, notes, now, now),
+        )
+        return cur.lastrowid if cur.rowcount else None
+
+
+def list_training_examples(role: str | None = None, label: str | None = None,
+                           source: str | None = None, project_id: int | None = None,
+                           active: bool | None = True, corrected_only: bool = False,
+                           missing_only: bool = False,
+                           limit: int = 500, offset: int = 0) -> list[dict]:
+    where, args = [], []
+    if role:
+        where.append("te.role=?"); args.append(role)
+    if label:
+        where.append("te.label=?"); args.append(label)
+    if source:
+        where.append("te.source=?"); args.append(source)
+    if project_id is not None:
+        where.append("te.project_id=?"); args.append(project_id)
+    if active is not None:
+        where.append("te.active=?"); args.append(1 if active else 0)
+    if corrected_only:
+        where.append("te.original_label<>'' AND te.label<>te.original_label")
+    q = ("SELECT te.*, p.name AS project_name FROM training_examples te "
+         "LEFT JOIN projects p ON p.id=te.project_id")
+    if where:
+        q += " WHERE " + " AND ".join(where)
+    q += " ORDER BY te.id DESC LIMIT ? OFFSET ?"
+    args += [limit, offset]
+    with get_db() as db:
+        rows = _rows(db.execute(q, args))
+    if missing_only:
+        rows = [r for r in rows if not Path(r["image_path"]).exists()]
+    return rows
+
+
+def count_training_examples(role: str | None = None, active: bool | None = True) -> int:
+    where, args = [], []
+    if role:
+        where.append("role=?"); args.append(role)
+    if active is not None:
+        where.append("active=?"); args.append(1 if active else 0)
+    q = "SELECT COUNT(*) n FROM training_examples"
+    if where:
+        q += " WHERE " + " AND ".join(where)
+    with get_db() as db:
+        return db.execute(q, args).fetchone()["n"]
+
+
+def get_training_example(example_id: int) -> dict | None:
+    with get_db() as db:
+        row = db.execute(
+            "SELECT te.*, p.name AS project_name FROM training_examples te "
+            "LEFT JOIN projects p ON p.id=te.project_id WHERE te.id=?",
+            (example_id,)).fetchone()
+        return dict(row) if row else None
+
+
+def update_training_example(example_id: int, **fields) -> None:
+    """Correct a label, edit notes, or toggle active (soft delete/restore)."""
+    allowed = {"label", "notes", "active", "source"}
+    sets = {k: v for k, v in fields.items() if k in allowed}
+    if not sets:
+        return
+    if "active" in sets:
+        sets["active"] = 1 if sets["active"] else 0
+    sets["updated_at"] = utcnow()
+    cols = ", ".join(f"{k}=?" for k in sets)
+    with _write_lock, get_db() as db:
+        db.execute(f"UPDATE training_examples SET {cols} WHERE id=?",
+                   (*sets.values(), example_id))
+
+
+def bulk_update_training_examples(ids: list[int], **fields) -> int:
+    allowed = {"label", "active", "source"}
+    sets = {k: v for k, v in fields.items() if k in allowed}
+    if not sets or not ids:
+        return 0
+    if "active" in sets:
+        sets["active"] = 1 if sets["active"] else 0
+    sets["updated_at"] = utcnow()
+    cols = ", ".join(f"{k}=?" for k in sets)
+    marks = ",".join("?" * len(ids))
+    with _write_lock, get_db() as db:
+        cur = db.execute(
+            f"UPDATE training_examples SET {cols} WHERE id IN ({marks})",
+            (*sets.values(), *ids))
+        return cur.rowcount
+
+
+def delete_training_examples(ids: list[int], remove_files: bool = False) -> dict:
+    """
+    Hard-delete rows. Only unlinks the image when *remove_files* is set, and
+    only for sources the app itself produced (synthetic/curated copies) —
+    never a reviewer's original scan on the share.
+    """
+    if not ids:
+        return {"deleted": 0, "files_removed": 0}
+    marks = ",".join("?" * len(ids))
+    removed = 0
+    with get_db() as db:
+        rows = _rows(db.execute(
+            f"SELECT id, image_path, source FROM training_examples WHERE id IN ({marks})",
+            ids))
+    if remove_files:
+        for r in rows:
+            if r["source"] not in ("synthetic", "curated"):
+                continue
+            try:
+                Path(r["image_path"]).unlink(missing_ok=True)
+                removed += 1
+            except OSError:
+                pass
+    with _write_lock, get_db() as db:
+        cur = db.execute(f"DELETE FROM training_examples WHERE id IN ({marks})", ids)
+    return {"deleted": cur.rowcount, "files_removed": removed}
+
+
+def training_example_stats(role: str) -> dict:
+    """Label/source breakdown for the data browser header."""
+    with get_db() as db:
+        by_label = {r["label"]: r["n"] for r in db.execute(
+            "SELECT label, COUNT(*) n FROM training_examples "
+            "WHERE role=? AND active=1 GROUP BY label", (role,))}
+        by_source = {r["source"]: r["n"] for r in db.execute(
+            "SELECT source, COUNT(*) n FROM training_examples "
+            "WHERE role=? AND active=1 GROUP BY source", (role,))}
+        agg = db.execute(
+            "SELECT COUNT(*) total, "
+            "SUM(active=0) inactive, "
+            "SUM(original_label<>'' AND label<>original_label) corrected "
+            "FROM training_examples WHERE role=?", (role,)).fetchone()
+    return {
+        "by_label": by_label,
+        "by_source": by_source,
+        "total_active": sum(by_label.values()),
+        "total": agg["total"] or 0,
+        "inactive": agg["inactive"] or 0,
+        "corrected": agg["corrected"] or 0,
+    }

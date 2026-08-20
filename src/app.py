@@ -40,6 +40,13 @@ from .config import (
 
 app = Flask(__name__)
 
+# The project-centric interface lives in src/web (blueprints) with real
+# templates/static under src/. The classic single-page UI below is untouched
+# and still served at "/" while the new surfaces are built out.
+from . import web  # noqa: E402  (imported after app for blueprint registration)
+
+web.register(app)
+
 
 # ---------------------------------------------------------------------------
 # Authentication (unchanged from the original app)
