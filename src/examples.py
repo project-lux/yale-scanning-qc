@@ -10,8 +10,10 @@ row that owns its label, and this module is the only thing that writes them.
 Three sources feed in:
 
   human      — reviewer verdicts on scanned files (via ``reviews``)
-  curated    — real images imported from outside the app (CURATED_DIR)
-  synthetic  — degraded images manufactured by :mod:`src.synth` (SYNTHETIC_DIR)
+  curated    — real images imported from outside the app (explicit bad
+               captures from the share, or dropped into CURATED_DIR by hand)
+  project    — presumed-clean pages sampled from a project; the pool the
+               dataset builder draws negatives from
   llm        — weak page-type labels from the transcription backend
 
 :func:`sync` is **insert-only and idempotent**. It never rewrites the label
@@ -23,11 +25,11 @@ are durable.
 from pathlib import Path
 
 from . import db
-from .config import BAD_SCAN_CLASSES, CURATED_DIR, MODEL_ROLES, SYNTHETIC_DIR
+from .config import BAD_SCAN_CLASSES, CURATED_DIR, MODEL_ROLES
 
 # Sources that live as files the app itself wrote, and so may be deleted
 # from disk when their row is deleted.
-OWNED_SOURCES = ("synthetic", "curated")
+OWNED_SOURCES = ("curated", "project")
 
 IMAGE_SUFFIXES = (".jpg", ".jpeg", ".png")
 
@@ -67,7 +69,12 @@ def _sync_dir(role: str, base: Path, source: str, projects: list[dict]) -> int:
 
 
 def _sync_reviews(role: str, projects: list[dict]) -> int:
-    """Ingest reviewer verdicts (and LLM page types) as examples."""
+    """
+    Ingest reviewer verdicts (and LLM page types) as examples.
+
+    The verdict is stored on the row so the dataset builder can tell which
+    examples a previous model got wrong and always keep them.
+    """
     if role == "badscan":
         rows = db.labeled_badscan_examples()
     else:
@@ -85,6 +92,7 @@ def _sync_reviews(role: str, projects: list[dict]) -> int:
             role=role, label=e["label"], source=source, image_path=jpeg,
             project_id=_project_id_for(e.get("filepath") or jpeg, projects),
             origin_ref=e.get("filepath") or "",
+            verdict=e.get("verdict") or "",
         ) is not None:
             added += 1
     return added
@@ -101,7 +109,6 @@ def sync(role: str) -> dict:
     added = {
         "human": _sync_reviews(role, projects),
         "curated": _sync_dir(role, CURATED_DIR / role, "curated", projects),
-        "synthetic": _sync_dir(role, SYNTHETIC_DIR / role, "synthetic", projects),
     }
     added["total"] = sum(added.values())
     return added
@@ -127,6 +134,8 @@ def for_training(role: str) -> list[dict]:
             "jpeg_path": p,
             "label": r["label"],
             "source": r["source"],
+            "project_id": r["project_id"],
+            "verdict": r["verdict"] or "",
         })
     return out
 

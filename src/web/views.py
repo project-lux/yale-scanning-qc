@@ -5,7 +5,7 @@ from flask import Blueprint, render_template
 from .. import db
 from ..config import MODEL_ROLES, all_page_types
 
-bp = Blueprint("views", __name__, url_prefix="/ff")
+bp = Blueprint("views", __name__)
 
 
 @bp.get("/")
@@ -28,6 +28,29 @@ def project_detail(project_id: int):
         active_nav="projects",
         project=project,
         page_types=all_page_types(settings),
+    )
+
+
+@bp.get("/training")
+def training_page():
+    """Live training: start a run and watch it, plus run history."""
+    return render_template(
+        "training.html",
+        active_nav="training",
+        roles=list(MODEL_ROLES),
+    )
+
+
+@bp.get("/settings")
+def settings_page():
+    """Editable settings, grouped by what they affect."""
+    from ..config import DEFAULT_SETTINGS
+
+    return render_template(
+        "settings.html",
+        active_nav="settings",
+        settings=db.get_settings(),
+        keys=sorted(DEFAULT_SETTINGS.keys()),
     )
 
 

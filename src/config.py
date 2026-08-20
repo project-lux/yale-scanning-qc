@@ -43,16 +43,20 @@ DB_PATH = DATA_DIR / "qc.db"
 REGISTRY_DIR = MODELS_DIR / "registry"
 DATASETS_DIR = DATA_DIR / "datasets"
 TRAIN_RUNS_DIR = PROJECT_ROOT / "runs" / "feedback"
-# Persistent synthetic training examples (e.g. degraded bad-scan positives).
-# Layout: <SYNTHETIC_DIR>/<role>/<label>/*.jpg — kept permanently and folded
-# into every dataset snapshot for that role.
-SYNTHETIC_DIR = DATA_DIR / "synthetic"
-# Curated real-world examples imported from outside the app (e.g. the legacy
-# reviewer verdicts harvested off the DSCA share). Same layout as
-# SYNTHETIC_DIR, but these are genuine human-labeled scans, so they are
-# tracked with source 'curated' rather than 'synthetic'.
-# Layout: <CURATED_DIR>/<role>/<label>/*.jpg
+# Curated real-world examples dropped in by hand, kept as an escape hatch.
+# Layout: <CURATED_DIR>/<role>/<label>/*.jpg — the folder names the class.
 CURATED_DIR = DATA_DIR / "curated"
+
+# Viewing copies of imported training images. Rows in `training_examples`
+# own the label, so these are organised by provenance, not by class.
+# Layout: <IMAGES_DIR>/<role>/<source>/<name>.jpg
+IMAGES_DIR = DATA_DIR / "images"
+
+# Longest side kept for a stored viewing copy. Archival TIFFs are far larger
+# than anything the UI or the trainer needs (training runs at imgsz=640),
+# so only this reduced JPEG is ever copied off the share.
+IMPORT_MAX_SIDE = 1500
+IMPORT_JPEG_QUALITY = 88
 
 # ---------------------------------------------------------------------------
 # Remote GPU box (DGX Spark) — offloads training and/or batch inference.
@@ -129,6 +133,11 @@ DEFAULT_SETTINGS = {
     "custom_page_types": "",
     "retrain_epochs": "50",
     "retrain_auto_activate": "1",
+    # Dataset composition. Every bad scan and every past model mistake is
+    # always included; clean scans are sampled, spread evenly across
+    # projects, to this multiple of the positive count.
+    "neg_sample_ratio": "1.5",
+    "neg_sample_seed": "",          # blank = a fresh sample per build
 }
 
 # QC subdirectory names (created under watched directory)
@@ -187,6 +196,6 @@ DETECTION_COLORS = {
 
 # Create directories
 for dir_path in [DATA_DIR, RAW_IMAGES_DIR, AUGMENTED_DIR, MODELS_DIR, MANIFESTS_DIR,
-                 REGISTRY_DIR, DATASETS_DIR]:
+                 REGISTRY_DIR, DATASETS_DIR, IMAGES_DIR]:
     dir_path.mkdir(parents=True, exist_ok=True)
 

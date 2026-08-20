@@ -358,7 +358,7 @@
     btn.textContent = 'Sync sources';
   });
 
-  /* Deep link from a project card: /ff/data?project=<id>&role=<role> */
+  /* Deep link from a project card: /data?project=<id>&role=<role> */
   function applyUrlFilters() {
     const q = new URLSearchParams(location.search);
     const project = q.get('project');

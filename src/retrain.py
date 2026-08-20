@@ -126,12 +126,102 @@ def dataset_summary(role: str) -> dict:
 # Dataset snapshots (versioned, browsable, reproducible)
 # ---------------------------------------------------------------------------
 
+def _is_model_error(e: dict) -> bool:
+    """
+    True when a previous model got this image wrong: the reviewer either
+    cleared something it flagged (false_positive) or caught something it
+    missed (false_negative). These are the most informative examples we
+    have, so they are never sampled out.
+    """
+    return e.get("verdict") in ("false_positive", "false_negative")
+
+
+def select_badscan_examples(examples: list[dict], settings: dict | None = None,
+                            seed: int | None = None) -> tuple[list[dict], dict]:
+    """
+    Choose the bad-scan training set under the standing policy:
+
+      * every bad_scan example is always included;
+      * every example a previous model got wrong is always included, even
+        when it is a clean page (those are the hard negatives);
+      * the remaining clean pages are sampled at random, spread evenly
+        across projects, to `neg_sample_ratio` times the positive count.
+
+    The sample is deliberately re-drawn on every build (unless
+    `neg_sample_seed` is set), so successive dataset versions see different
+    clean pages and the model is not fitted to one fixed slice of them.
+
+    Returns (chosen, report).
+    """
+    settings = settings if settings is not None else db.get_settings()
+    try:
+        ratio = float(settings.get("neg_sample_ratio") or 1.5)
+    except ValueError:
+        ratio = 1.5
+    if seed is None:
+        raw = (settings.get("neg_sample_seed") or "").strip()
+        seed = int(raw) if raw.isdigit() else None
+    rng = random.Random(seed)  # seed=None -> fresh sample each build
+
+    always, pool = [], []
+    for e in examples:
+        if e["label"] == "bad_scan" or _is_model_error(e):
+            always.append(e)
+        else:
+            pool.append(e)
+
+    n_pos = sum(1 for e in always if e["label"] == "bad_scan")
+    target = max(MIN_PER_CLASS, int(round(n_pos * ratio)))
+    # Negatives already forced in (cleared false positives) count toward it.
+    forced_neg = len(always) - n_pos
+    need = max(0, target - forced_neg)
+
+    # Spread the draw evenly over projects so no single volume dominates.
+    by_project: dict[int | None, list[dict]] = {}
+    for e in pool:
+        by_project.setdefault(e.get("project_id"), []).append(e)
+    for group in by_project.values():
+        rng.shuffle(group)
+
+    sampled: list[dict] = []
+    if need and by_project:
+        keys = sorted(by_project, key=lambda k: (k is None, k))
+        i = 0
+        while len(sampled) < need and any(by_project[k] for k in keys):
+            group = by_project[keys[i % len(keys)]]
+            if group:
+                sampled.append(group.pop())
+            i += 1
+
+    chosen = always + sampled
+    report = {
+        "positives": n_pos,
+        "model_errors": sum(1 for e in always if _is_model_error(e)),
+        "forced_negatives": forced_neg,
+        "sampled_negatives": len(sampled),
+        "negative_pool": len(pool),
+        "neg_sample_ratio": ratio,
+        "neg_sample_seed": seed,
+        "per_project_sampled": {
+            str(k): sum(1 for e in sampled if e.get("project_id") == k)
+            for k in sorted(by_project, key=lambda k: (k is None, k))
+        },
+    }
+    return chosen, report
+
+
 def build_dataset(role: str, notes: str = "") -> dict:
     """
     Snapshot the current labeled examples into a new immutable dataset
     version (train/val split assigned per example) and return its record.
+
+    For badscan the snapshot is a *selection*, not the whole store — see
+    :func:`select_badscan_examples`. Page-type keeps every example.
     """
     examples = _examples(role)
+    selection_report: dict = {}
+    if role == "badscan":
+        examples, selection_report = select_badscan_examples(examples)
     classes = _role_classes(role, examples)
     counts = Counter(e["label"] for e in examples)
 
@@ -140,7 +230,7 @@ def build_dataset(role: str, notes: str = "") -> dict:
             if counts.get(cls, 0) < MIN_PER_CLASS:
                 raise ValueError(
                     f"Not enough examples for '{cls}': {counts.get(cls, 0)}/{MIN_PER_CLASS}. "
-                    "Review more scans (or add synthetic bad scans) first."
+                    "Import or review more scans first."
                 )
     elif len(classes) < 2:
         raise ValueError(
@@ -167,6 +257,13 @@ def build_dataset(role: str, notes: str = "") -> dict:
             })
 
     version = db.next_dataset_version(role)
+    if selection_report:
+        detail = (f"{selection_report['positives']} bad, "
+                  f"{selection_report['model_errors']} past model errors, "
+                  f"{selection_report['sampled_negatives']} clean sampled "
+                  f"of {selection_report['negative_pool']} "
+                  f"(ratio {selection_report['neg_sample_ratio']})")
+        notes = f"{notes} — {detail}" if notes else detail
     ds_id = db.create_dataset(role, version, classes, notes or
                               f"Snapshot of {len(items)} labeled examples.", items)
     return db.get_dataset(ds_id)
@@ -291,12 +388,20 @@ def train(role: str, epochs: int = 50, auto_activate: bool = True,
         where = "remote" if (remote and remote.training_enabled()) else "local"
         progress = {"role": role, "version": version, "dataset": ds["version"],
                     "epochs": epochs, "status": "training", "where": where,
-                    "counts": ds_info["counts"]}
+                    "counts": ds_info["counts"], "run_id": run_id,
+                    "started_at": db.utcnow(), "epoch": 0, "history": []}
         print(f"[retrain] {version} from {ds['version']} ({where}): {ds_info['counts']}")
 
         if where == "remote":
             def _cb(st):
-                progress.update(epoch=st.get("epoch"), remote_status=st.get("status"))
+                # Mirror the box's per-epoch history so the live view can
+                # chart loss/accuracy while the run is still going.
+                progress.update(
+                    epoch=st.get("epoch"),
+                    epochs=st.get("epochs") or epochs,
+                    remote_status=st.get("status"),
+                    history=st.get("history") or [],
+                )
             best, remote_metrics = remote.train_remote(
                 ds_dir, Path(weights),
                 {"role": role, "version": version, "classes": _role_classes(role, _examples(role)),

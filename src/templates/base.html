@@ -14,7 +14,10 @@
          class="{{ 'on' if active_nav == 'projects' }}">Projects</a>
       <a href="{{ url_for('views.data_browser') }}"
          class="{{ 'on' if active_nav == 'data' }}">Training data</a>
-      <a href="/">Classic UI</a>
+      <a href="{{ url_for('views.training_page') }}"
+         class="{{ 'on' if active_nav == 'training' }}">Training</a>
+      <a href="{{ url_for('views.settings_page') }}"
+         class="{{ 'on' if active_nav == 'settings' }}">Settings</a>
     </nav>
   </header>
 

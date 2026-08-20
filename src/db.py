@@ -52,11 +52,15 @@ CREATE TABLE IF NOT EXISTS training_examples (
     role           TEXT NOT NULL,              -- 'badscan' | 'pagetype'
     label          TEXT NOT NULL,
     original_label TEXT NOT NULL DEFAULT '',
-    source         TEXT NOT NULL,              -- human | curated | synthetic | llm
+    source         TEXT NOT NULL,              -- human | curated | project | llm
     image_path     TEXT NOT NULL,
     project_id     INTEGER REFERENCES projects(id),
     scan_id        INTEGER REFERENCES scans(id),
-    origin_ref     TEXT NOT NULL DEFAULT '',   -- verdict json, defect kind, …
+    origin_ref     TEXT NOT NULL DEFAULT '',   -- verdict json, source path, …
+    -- Review verdict this example came from, when it came from one. A
+    -- false_positive/false_negative means a model got this image wrong,
+    -- which the dataset builder always keeps rather than sampling out.
+    verdict        TEXT NOT NULL DEFAULT '',
     notes          TEXT NOT NULL DEFAULT '',
     active         INTEGER NOT NULL DEFAULT 1,
     created_at     TEXT NOT NULL,
@@ -220,6 +224,10 @@ def init_db() -> None:
         # Batches become project-scoped; existing rows are backfilled below.
         try:
             db.execute("ALTER TABLE batches ADD COLUMN project_id INTEGER REFERENCES projects(id)")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            db.execute("ALTER TABLE training_examples ADD COLUMN verdict TEXT NOT NULL DEFAULT ''")
         except sqlite3.OperationalError:
             pass
 
@@ -673,6 +681,9 @@ def labeled_badscan_examples() -> list[dict]:
             "jpeg_path": row["jpeg_path"],
             "label": label,
             "source": "human",
+            # Carried through so the dataset builder can always keep the
+            # images a previous model got wrong.
+            "verdict": row["verdict"],
         }
     return list(latest.values())
 
@@ -748,7 +759,9 @@ def finish_training_run(run_id: int, status: str, error: str = "",
 def list_training_runs(limit: int = 50) -> list[dict]:
     with get_db() as db:
         return _rows(db.execute(
-            "SELECT t.*, m.version AS model_version, d.version AS dataset_version "
+            # A run's accuracy lives on the model it produced, not on the run.
+            "SELECT t.*, m.version AS model_version, m.metrics AS model_metrics, "
+            " d.version AS dataset_version "
             "FROM training_runs t "
             "LEFT JOIN models m ON m.id = t.model_id "
             "LEFT JOIN datasets d ON d.id = t.dataset_id "
@@ -915,7 +928,8 @@ def project_stats(project_id: int) -> dict:
 
 def add_training_example(role: str, label: str, source: str, image_path: str,
                          project_id: int | None = None, scan_id: int | None = None,
-                         origin_ref: str = "", notes: str = "") -> int | None:
+                         origin_ref: str = "", notes: str = "",
+                         verdict: str = "") -> int | None:
     """
     Insert one labeled image. Returns its id, or None if this (role,
     image_path) is already present — re-imports never clobber a label the
@@ -926,10 +940,10 @@ def add_training_example(role: str, label: str, source: str, image_path: str,
         cur = db.execute(
             "INSERT OR IGNORE INTO training_examples "
             "(role, label, original_label, source, image_path, project_id, "
-            " scan_id, origin_ref, notes, active, created_at, updated_at) "
-            "VALUES (?,?,?,?,?,?,?,?,?,1,?,?)",
+            " scan_id, origin_ref, notes, verdict, active, created_at, updated_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,1,?,?)",
             (role, label, label, source, str(image_path), project_id, scan_id,
-             origin_ref, notes, now, now),
+             origin_ref, notes, verdict, now, now),
         )
         return cur.lastrowid if cur.rowcount else None
 

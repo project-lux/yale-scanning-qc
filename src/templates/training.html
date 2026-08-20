@@ -1,0 +1,85 @@
+{% extends "base.html" %}
+{% block title %}Training — Yale Scanning QC{% endblock %}
+
+{% block content %}
+<div class="pagehead">
+  <div>
+    <h1>Training</h1>
+    <p class="sub">Runs on the GPU box; progress streams here live.</p>
+  </div>
+  <div class="headactions">
+    <label class="field"><span>Model</span>
+      <select id="roleSel">
+        {% for r in roles %}<option value="{{ r }}">{{ r }}</option>{% endfor %}
+      </select></label>
+    <label class="field"><span>Epochs</span>
+      <input class="input" id="epochs" type="number" min="1" max="1000" value="50" style="width:90px"></label>
+    <button class="btn" id="previewBtn">Preview data</button>
+    <button class="btn primary" id="startBtn">Start training</button>
+  </div>
+</div>
+
+<section class="statbar" id="gpubar"></section>
+
+<!-- What the next dataset build would select -->
+<section class="filters" id="selectionPanel" hidden>
+  <div style="width:100%">
+    <strong>Dataset selection</strong>
+    <p class="sub" id="selectionText"></p>
+    <div class="statbar" id="selectionChips" style="margin:8px 0 0"></div>
+  </div>
+</section>
+
+<!-- Live run -->
+<section class="panel runpanel" id="runpanel" hidden>
+  <div class="runhead">
+    <span class="spinner" id="runSpin"></span>
+    <strong id="runTitle">—</strong>
+    <span class="hint" id="runSub"></span>
+    <span class="grow"></span>
+    <span class="chip" id="runEpoch">epoch 0</span>
+    <span class="chip" id="runWhere">—</span>
+  </div>
+  <div class="bar"><div class="barfill" id="runBar"></div></div>
+
+  <div class="charts">
+    <figure class="chart">
+      <figcaption>Loss <span class="hint" id="lossLatest"></span></figcaption>
+      <div id="lossChart" class="chartbox"></div>
+    </figure>
+    <figure class="chart">
+      <figcaption>Accuracy (top-1) <span class="hint" id="accLatest"></span></figcaption>
+      <div id="accChart" class="chartbox"></div>
+    </figure>
+  </div>
+  <p class="hint" id="noMetrics" hidden>
+    Waiting for the first epoch to report metrics…
+  </p>
+</section>
+
+<h2 class="sectionh">Recent runs</h2>
+<div class="tablewrap">
+  <table class="table" id="runsTable">
+    <thead><tr>
+      <th>Run</th><th>Model</th><th>Dataset</th><th>Epochs</th>
+      <th>Accuracy</th><th>Status</th><th>Started</th>
+    </tr></thead>
+    <tbody></tbody>
+  </table>
+</div>
+
+<h2 class="sectionh">Model versions</h2>
+<div class="tablewrap">
+  <table class="table" id="modelsTable">
+    <thead><tr>
+      <th>Version</th><th>Role</th><th>Dataset</th><th>Accuracy</th>
+      <th>Created</th><th></th>
+    </tr></thead>
+    <tbody></tbody>
+  </table>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script src="{{ url_for('static', filename='js/training.js') }}"></script>
+{% endblock %}

@@ -1,0 +1,20 @@
+{% extends "base.html" %}
+{% block title %}Settings — Yale Scanning QC{% endblock %}
+
+{% block content %}
+<div class="pagehead">
+  <div>
+    <h1>Settings</h1>
+    <p class="sub">Stored in the database and applied on the next pass or build.</p>
+  </div>
+  <div class="headactions">
+    <button class="btn primary" id="saveBtn">Save changes</button>
+  </div>
+</div>
+
+<div id="groups"></div>
+{% endblock %}
+
+{% block scripts %}
+<script src="{{ url_for('static', filename='js/settings.js') }}"></script>
+{% endblock %}

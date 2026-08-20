@@ -27,6 +27,7 @@ import json
 import os
 import shutil
 import threading
+import time
 import traceback
 import uuid
 import zipfile
@@ -111,25 +112,84 @@ def _set_job(job_id: str, **fields):
         (JOBS_DIR / job_id / "status.json").write_text(json.dumps(_jobs[job_id], default=str))
 
 
+def _epoch_snapshot(trainer) -> dict:
+    """
+    Per-epoch numbers for the live training view.
+
+    Ultralytics exposes these inconsistently across tasks and versions, so
+    every field is probed defensively: a missing metric should cost one
+    line on a chart, never the training run.
+    """
+    snap: dict = {"epoch": int(getattr(trainer, "epoch", 0)) + 1}
+
+    # Training loss: tloss is a tensor (or tuple of them) of running means.
+    try:
+        tloss = getattr(trainer, "tloss", None)
+        if tloss is not None:
+            vals = tloss.tolist() if hasattr(tloss, "tolist") else list(tloss)
+            if isinstance(vals, (int, float)):
+                snap["train_loss"] = float(vals)
+            elif vals:
+                snap["train_loss"] = float(sum(float(v) for v in vals) / len(vals))
+    except Exception:
+        pass
+
+    # Validation metrics, keyed as ultralytics reports them.
+    try:
+        for k, v in (getattr(trainer, "metrics", None) or {}).items():
+            if not isinstance(v, (int, float)):
+                continue
+            key = k.split("/")[-1]
+            if key == "accuracy_top1":
+                snap["top1"] = float(v)
+            elif key == "accuracy_top5":
+                snap["top5"] = float(v)
+            elif key == "fitness":
+                snap["fitness"] = float(v)
+            elif "loss" in key:
+                snap["val_loss"] = float(v)
+    except Exception:
+        pass
+
+    try:
+        lrs = getattr(trainer, "lr", None) or {}
+        if lrs:
+            snap["lr"] = float(next(iter(lrs.values())))
+    except Exception:
+        pass
+
+    return snap
+
+
 def _train_worker(job_id: str, params: dict):
     job_dir = JOBS_DIR / job_id
     ds_dir = job_dir / "dataset"
     base = job_dir / "base.pt"
     epochs = int(params.get("epochs", 50))
     imgsz = int(params.get("imgsz", 640))
+    started = time.time()
+    history: list[dict] = []
     try:
         _set_job(job_id, status="waiting_gpu")
         with _gpu_lock:
-            _set_job(job_id, status="running", epoch=0, epochs=epochs)
+            _set_job(job_id, status="running", epoch=0, epochs=epochs,
+                     history=[], started_at=started)
             from ultralytics import YOLO
 
             model = YOLO(str(base))
 
             def _on_epoch(trainer):
                 try:
-                    _set_job(job_id, epoch=int(getattr(trainer, "epoch", 0)) + 1)
+                    snap = _epoch_snapshot(trainer)
+                    snap["elapsed"] = round(time.time() - started, 1)
+                    history.append(snap)
+                    _set_job(job_id, epoch=snap["epoch"], history=list(history))
                 except Exception:
-                    pass
+                    # Never let telemetry break a run.
+                    try:
+                        _set_job(job_id, epoch=int(getattr(trainer, "epoch", 0)) + 1)
+                    except Exception:
+                        pass
 
             model.add_callback("on_fit_epoch_end", _on_epoch)
 
@@ -148,7 +208,10 @@ def _train_worker(job_id: str, params: dict):
             metrics["top1_accuracy"] = float(results.results_dict.get("metrics/accuracy_top1", 0))
         except Exception:
             pass
-        _set_job(job_id, status="done", metrics=metrics, weights="best.pt")
+        metrics["history"] = history
+        metrics["train_seconds"] = round(time.time() - started, 1)
+        _set_job(job_id, status="done", metrics=metrics, weights="best.pt",
+                 history=history)
     except Exception as e:
         traceback.print_exc()
         _set_job(job_id, status="error", error=str(e))
