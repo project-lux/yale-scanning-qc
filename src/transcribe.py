@@ -1,12 +1,19 @@
 """
-LLM endpoints for handwriting transcription and page-type classification.
+Transcription and page-type classification backends.
 
-Two interchangeable backends, selected in Settings:
+Three interchangeable transcription backends, selected in Settings:
 
 - sglang: an OpenAI-compatible SGLang server on an adjacent machine
   (POST {base_url}/v1/chat/completions with an inline base64 image).
 - vertex: Google Vertex AI via the google-genai SDK
   (project cultural-heritage-gemini, model gemini-3.1-flash-lite).
+- kraken: local OCR — kraken segmentation + the PP-OCRv6 line recognizer
+  (see :mod:`src.ocr`). No network, no prompt; returns per-line polygons.
+- nara: local VLM — the NARA-tuned Qwen 0.8B via transformers on MPS
+  (see :mod:`src.nara`). Whole-page text, no polygons.
+
+Page-type classification still needs one of the LLM backends or a trained
+local model; kraken/nara only read text.
 
 Auth for Vertex uses Application Default Credentials
 (``gcloud auth application-default login`` on the QC host).
@@ -102,19 +109,35 @@ BACKENDS = {
     "vertex": _generate_vertex,
 }
 
+# Backends that can answer an arbitrary prompt about a page (and can
+# therefore double as the page-type classifier). kraken only reads text.
+LLM_BACKENDS = ("sglang", "vertex")
 
-def transcribe(jpeg_path: Path, settings: dict) -> tuple[str | None, str]:
+
+def transcribe(jpeg_path: Path, settings: dict) -> tuple[str | None, str, dict | None]:
     """
     Transcribe using the configured backend.
 
-    Returns (text, backend_name); (None, "") when the backend is 'off'.
+    Returns (text, backend_name, geometry); (None, "", None) when the
+    backend is 'off'. *geometry* is the per-line polygon layout from local
+    OCR (see :func:`src.ocr.transcribe_kraken`) — None for LLM backends,
+    which return plain text only.
     Raises on backend errors so the pipeline can record them per scan.
     """
     backend = settings.get("transcription_backend", "off")
+    if backend == "kraken":
+        from .ocr import transcribe_kraken
+
+        text, geometry = transcribe_kraken(jpeg_path, settings)
+        return text, backend, geometry
+    if backend == "nara":
+        from .nara import transcribe_nara
+
+        return transcribe_nara(jpeg_path, settings), backend, None
     fn = BACKENDS.get(backend)
     if fn is None:
-        return None, ""
-    return fn(jpeg_path, TRANSCRIPTION_PROMPT, settings), backend
+        return None, "", None
+    return fn(jpeg_path, TRANSCRIPTION_PROMPT, settings), backend, None
 
 
 def classify_page_llm(jpeg_path: Path, settings: dict,
@@ -128,7 +151,7 @@ def classify_page_llm(jpeg_path: Path, settings: dict,
     Raises on backend errors.
     """
     backend = settings.get("transcription_backend", "off")
-    fn = BACKENDS.get(backend)
+    fn = BACKENDS.get(backend) if backend in LLM_BACKENDS else None
     if fn is None:
         return None, ""
 

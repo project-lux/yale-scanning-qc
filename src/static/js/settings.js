@@ -27,7 +27,18 @@
       ['transcribe_page_types', 'Transcribe these page types', 'Comma-separated.'],
     ]],
     ['Transcription', [
-      ['transcription_backend', 'Backend', 'off | sglang | vertex'],
+      ['transcription_backend', 'Backend',
+       'off | sglang | vertex | kraken (local OCR with line polygons) | '
+       + 'nara (local Qwen VLM)'],
+      ['kraken_model_path', 'Kraken model file',
+       'Path to a kraken recognition model (.safetensors), e.g. the '
+       + 'PP-OCRv6 medium model.'],
+      ['kraken_device', 'Kraken device', 'mps | cpu | auto'],
+      ['nara_model_id', 'NARA VLM model',
+       'HuggingFace id or local directory of the page-transcription VLM.'],
+      ['nara_server_url', 'NARA vLLM server',
+       'Blank = run locally. "spark:8061" = vLLM on the DGX via the SSH '
+       + 'tunnel. Or a full http(s) URL.'],
       ['sglang_base_url', 'SGLang URL', ''],
       ['sglang_model', 'SGLang model', ''],
       ['sglang_api_key', 'SGLang API key', ''],

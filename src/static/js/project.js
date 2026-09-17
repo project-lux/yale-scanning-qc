@@ -14,6 +14,7 @@
     selected: new Set(),
     openIdx: -1,
     polling: null,
+    view: localStorage.getItem('qc-project-view') || 'grid',
   };
 
   /* ---------------- loading ---------------- */
@@ -23,6 +24,7 @@
     if ($('fFlagged').value) p.set('flagged', $('fFlagged').value);
     if ($('fReviewed').value) p.set('reviewed', $('fReviewed').value);
     if ($('fPageType').value) p.set('page_type', $('fPageType').value);
+    if ($('fTranscribed').value) p.set('transcribed', $('fTranscribed').value);
     return p.toString();
   }
 
@@ -31,7 +33,7 @@
       const d = await get(`/api/projects/${PID}/scans?${query()}`);
       state.rows = d.scans || [];
       renderCounts(d.counts || {});
-      renderGrid();
+      render();
       $('pageInfo').textContent = `page ${state.page} · ${state.rows.length} shown`;
       $('prevPage').disabled = state.page <= 1;
       $('nextPage').disabled = state.rows.length < state.perPage;
@@ -59,22 +61,34 @@
     return '';
   }
 
+  function hasPreview(r) {
+    return r.has_jpeg || /\.(jpe?g|png)$/i.test(r.filepath);
+  }
+
+  function badgesFor(r) {
+    const verdict = r.bad_scan
+      ? `<span class="tag ${esc(r.bad_scan)}">${esc(pretty(r.bad_scan))}` +
+        `${r.bad_scan_conf ? ` ${(r.bad_scan_conf * 100).toFixed(0)}%` : ''}</span>`
+      : '<span class="tag">unscored</span>';
+    return verdict +
+      (r.page_type ? `<span class="tag src">${esc(pretty(r.page_type))}</span>` : '');
+  }
+
+  function render() {
+    const isList = state.view === 'list';
+    $('grid').hidden = isList;
+    $('tlist').hidden = !isList;
+    $('empty').hidden = state.rows.length > 0;
+    if (isList) renderList(); else renderGrid();
+    updateBulk();
+  }
+
   function renderGrid() {
-    const g = $('grid');
-    if (!state.rows.length) {
-      g.innerHTML = '';
-      $('empty').hidden = false;
-      return;
-    }
-    $('empty').hidden = true;
-    g.innerHTML = state.rows.map((r, i) => {
-      const img = r.has_jpeg || /\.(jpe?g|png)$/i.test(r.filepath)
+    $('tlist').innerHTML = '';
+    $('grid').innerHTML = state.rows.map((r, i) => {
+      const img = hasPreview(r)
         ? `<img class="thumb" loading="lazy" src="/api/projects/scans/${r.id}/image" alt="">`
         : '<div class="missing">no preview</div>';
-      const verdict = r.bad_scan
-        ? `<span class="tag ${esc(r.bad_scan)}">${esc(pretty(r.bad_scan))}` +
-          `${r.bad_scan_conf ? ` ${(r.bad_scan_conf * 100).toFixed(0)}%` : ''}</span>`
-        : '<span class="tag">unscored</span>';
       const rev = reviewLabel(r.review_verdict);
       return `
         <div class="tile ${state.selected.has(r.id) ? 'sel' : ''}" data-idx="${i}" data-id="${r.id}">
@@ -83,15 +97,45 @@
           ${rev ? `<span class="flag">${esc(rev)}</span>` : ''}
           ${img}
           <div class="tmeta">
-            <div class="badges">
-              ${verdict}
-              ${r.page_type ? `<span class="tag src">${esc(pretty(r.page_type))}</span>` : ''}
-            </div>
+            <div class="badges">${badgesFor(r)}</div>
             <div class="fname" title="${esc(r.filepath)}">${esc(r.filename)}</div>
           </div>
         </div>`;
     }).join('');
-    updateBulk();
+  }
+
+  /* Transcription view: page image beside its OCR/LLM text and verdicts,
+     so the text can be read against the scan it came from. */
+  function renderList() {
+    $('grid').innerHTML = '';
+    $('tlist').innerHTML = state.rows.map((r, i) => {
+      const img = hasPreview(r)
+        ? `<img class="thumb" loading="lazy" src="/api/projects/scans/${r.id}/image" alt="">`
+        : '<div class="missing">no preview</div>';
+      const rev = reviewLabel(r.review_verdict);
+      const text = r.transcription
+        ? `<pre class="ttext">${esc(r.transcription)}</pre>`
+        : '<p class="hint">No transcription for this page.</p>';
+      return `
+        <div class="trow ${state.selected.has(r.id) ? 'sel' : ''}" data-idx="${i}" data-id="${r.id}">
+          <div class="timg">
+            <input type="checkbox" class="cb" ${state.selected.has(r.id) ? 'checked' : ''}
+                   aria-label="Select ${esc(r.filename)}">
+            ${img}
+          </div>
+          <div class="tbody">
+            <div class="trowhead">
+              <span class="fname" title="${esc(r.filepath)}">${esc(r.filename)}</span>
+              <span class="badges">
+                ${badgesFor(r)}
+                ${rev ? `<span class="tag rev">reviewed: ${esc(rev)}</span>` : ''}
+                ${r.transcription_backend ? `<span class="tag src">${esc(r.transcription_backend)}</span>` : ''}
+              </span>
+            </div>
+            ${text}
+          </div>
+        </div>`;
+    }).join('');
   }
 
   function updateBulk() {
@@ -101,7 +145,120 @@
     $('reprocessScope').textContent = n ? `${n} selected scan(s)` : 'whole project';
   }
 
-  /* ---------------- drawer + review ---------------- */
+  /* ---------------- viewer + review ---------------- */
+
+  const SVG_NS = 'http://www.w3.org/2000/svg';
+
+  function parseGeometry(raw) {
+    if (!raw) return null;
+    try {
+      const g = JSON.parse(raw);
+      return g && g.w && g.h && Array.isArray(g.lines) && g.lines.length ? g : null;
+    } catch { return null; }
+  }
+
+  /* Line polygons over the page image; hovering either side highlights both. */
+  function renderOverlay(geom) {
+    const svg = $('dOverlay');
+    svg.innerHTML = '';
+    if (!geom) { svg.style.display = 'none'; return; }
+    svg.style.display = '';
+    svg.setAttribute('viewBox', `0 0 ${geom.w} ${geom.h}`);
+    geom.lines.forEach((ln, i) => {
+      const pts = ln.polygon && ln.polygon.length >= 3 ? ln.polygon
+        : (ln.baseline || []);
+      if (pts.length < 2) return;
+      const poly = document.createElementNS(SVG_NS, 'polygon');
+      poly.setAttribute('points', pts.map((p) => p.join(',')).join(' '));
+      poly.dataset.line = String(i);
+      if (ln.text) {
+        const title = document.createElementNS(SVG_NS, 'title');
+        title.textContent = ln.text;
+        poly.appendChild(title);
+      }
+      svg.appendChild(poly);
+    });
+  }
+
+  /* Show one backend's transcription (text + polygons when it has them). */
+  function showTranscription(entry) {
+    const box = $('dTranscript');
+    const out = $('dTranscriptText');
+    const geom = entry ? entry.geom : null;
+    renderOverlay(geom);
+    $('dTranscriptBackend').textContent = entry ? (entry.backend || '') : '';
+    $('dLineHint').textContent = geom
+      ? `${geom.lines.length} line(s) — hover a box or a text row`
+      : '';
+    if (geom) {
+      box.hidden = false;
+      out.innerHTML = geom.lines.map((ln, i) => {
+        const conf = ln.confidence != null ? ` · ${(ln.confidence * 100).toFixed(0)}%` : '';
+        return `<span class="tline" data-line="${i}" title="line ${i + 1}${conf}">${esc(ln.text)}</span>`;
+      }).join('');
+    } else if (entry && entry.text) {
+      box.hidden = false;
+      out.innerHTML = `<pre>${esc(entry.text)}</pre>`;
+    } else if (entry) {
+      box.hidden = false;
+      out.innerHTML = '<pre class="hint">(no text found on this page)</pre>';
+    } else {
+      box.hidden = true;
+      out.innerHTML = '';
+    }
+  }
+
+  /* Swap tabs — one per backend that has transcribed this scan. */
+  function applyTranscriptions(r) {
+    const entries = r._trans || [];
+    const tabs = $('dTransTabs');
+    if (!entries.length) {
+      tabs.innerHTML = '';
+      return;
+    }
+    const active = entries.find((e) => e.backend === r._activeBackend)
+      || entries.find((e) => e.backend === r.transcription_backend)
+      || entries[0];
+    r._activeBackend = active.backend;
+    showTranscription(active);
+    tabs.innerHTML = entries.length < 2 ? '' : entries.map((e) =>
+      `<button class="ttab ${e.backend === active.backend ? 'on' : ''}"
+               data-backend="${esc(e.backend)}">${esc(e.backend)}</button>`).join('');
+  }
+
+  $('dTransTabs').addEventListener('click', (ev) => {
+    const b = ev.target.closest('.ttab');
+    const r = state.rows[state.openIdx];
+    if (!b || !r) return;
+    r._activeBackend = b.dataset.backend;
+    applyTranscriptions(r);
+  });
+
+  function setLineHl(i, on) {
+    document.querySelectorAll(`#dOverlay polygon[data-line="${i}"], #dTranscriptText .tline[data-line="${i}"]`)
+      .forEach((el) => el.classList.toggle('hl', on));
+  }
+
+  function bindHover(container, scrollTarget) {
+    let last = null;
+    container.addEventListener('mouseover', (ev) => {
+      const t = ev.target.closest('[data-line]');
+      const i = t ? t.dataset.line : null;
+      if (i === last) return;
+      if (last !== null) setLineHl(last, false);
+      last = i;
+      if (i === null) return;
+      setLineHl(i, true);
+      const other = document.querySelector(`${scrollTarget}[data-line="${i}"]`);
+      if (other && other.scrollIntoView) other.scrollIntoView({ block: 'nearest' });
+    });
+    container.addEventListener('mouseleave', () => {
+      if (last !== null) setLineHl(last, false);
+      last = null;
+    });
+  }
+  bindHover($('dOverlay'), '#dTranscriptText .tline');
+  bindHover($('dTranscriptText'), '#dOverlay polygon');
 
   function openDrawer(idx) {
     const r = state.rows[idx];
@@ -128,10 +285,30 @@
       ['Status', r.status + (r.error ? ` — ${r.error}` : '')],
       ['Path', r.filepath],
     ];
-    if (r.transcription) rows.push(['Transcription', r.transcription.slice(0, 300)]);
     $('dMeta').innerHTML = rows.map(([k, v]) =>
       `<div class="row"><span class="k">${esc(k)}</span><span class="v">${esc(v)}</span></div>`
     ).join('');
+
+    // Show the pass's own transcription immediately, then fetch every
+    // backend's reading for the swap tabs.
+    showTranscription(r.transcription != null ? {
+      backend: r.transcription_backend || '',
+      text: r.transcription,
+      geom: parseGeometry(r.transcription_lines),
+    } : null);
+    $('dTransTabs').innerHTML = '';
+    if (r._trans) {
+      applyTranscriptions(r);
+    } else {
+      get(`/api/projects/scans/${r.id}/transcriptions`).then((d) => {
+        r._trans = (d.transcriptions || []).map((t) => ({
+          backend: t.backend,
+          text: t.text,
+          geom: parseGeometry(t.lines),
+        }));
+        if (state.rows[state.openIdx] === r) applyTranscriptions(r);
+      }).catch(() => {});
+    }
 
     // Show which bookkeeping verdict the answer will record.
     const flagged = r.bad_scan === 'bad_scan';
@@ -148,6 +325,10 @@
   }
 
   const closeDrawer = () => { $('drawer').hidden = true; state.openIdx = -1; };
+  // Click on the dimmed backdrop (outside the box) closes the viewer.
+  $('drawer').addEventListener('click', (ev) => {
+    if (ev.target === $('drawer')) closeDrawer();
+  });
 
   async function submitVerdict(isBad) {
     if (state.openIdx < 0) return;
@@ -166,7 +347,7 @@
         has_jpeg: r.has_jpeg,
       });
       toast(`Recorded: ${isBad ? 'bad scan' : 'looks fine'} (${d.verdict.replace(/_/g, ' ')})`);
-      renderGrid();
+      render();
       // Move straight on — reviewing is a queue.
       if (state.openIdx < state.rows.length - 1) openDrawer(state.openIdx + 1);
       else openDrawer(state.openIdx);
@@ -234,6 +415,7 @@
     if (!stages.length) { toast('Pick at least one stage', true); return; }
     try {
       const body = { stages };
+      if ($('stForce').checked) body.force_transcribe = true;
       if (state.selected.size) body.scan_ids = [...state.selected];
       const d = await post(`/api/projects/${PID}/rerun-stages`, body);
       $('reprocessPanel').hidden = true;
@@ -250,8 +432,8 @@
 
   /* ---------------- events ---------------- */
 
-  $('grid').addEventListener('click', (ev) => {
-    const tile = ev.target.closest('.tile');
+  function onRowClick(ev) {
+    const tile = ev.target.closest('.tile, .trow');
     if (!tile) return;
     const id = Number(tile.dataset.id);
     if (ev.target.classList.contains('cb')) {
@@ -262,7 +444,9 @@
       return;
     }
     openDrawer(Number(tile.dataset.idx));
-  });
+  }
+  $('grid').addEventListener('click', onRowClick);
+  $('tlist').addEventListener('click', onRowClick);
 
   $('vBad').addEventListener('click', () => submitVerdict(true));
   $('vGood').addEventListener('click', () => submitVerdict(false));
@@ -273,12 +457,18 @@
 
   $('selAll').addEventListener('click', () => {
     state.rows.forEach((r) => state.selected.add(r.id));
-    renderGrid();
+    render();
   });
-  $('selNone').addEventListener('click', () => { state.selected.clear(); renderGrid(); });
+  $('selNone').addEventListener('click', () => { state.selected.clear(); render(); });
 
-  ['fFlagged', 'fReviewed', 'fPageType'].forEach((id) =>
+  ['fFlagged', 'fReviewed', 'fPageType', 'fTranscribed'].forEach((id) =>
     $(id).addEventListener('change', () => { state.page = 1; load(); }));
+  $('fView').value = state.view;
+  $('fView').addEventListener('change', (ev) => {
+    state.view = ev.target.value === 'list' ? 'list' : 'grid';
+    localStorage.setItem('qc-project-view', state.view);
+    render();
+  });
   $('fPer').addEventListener('change', (ev) => {
     state.perPage = Number(ev.target.value) || 60;
     state.page = 1;

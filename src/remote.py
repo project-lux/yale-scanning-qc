@@ -37,55 +37,60 @@ POLL_MAX_SECONDS = 6 * 60 * 60  # safety ceiling for a single training job
 # and no host alias. Otherwise it falls back to TRAIN_SERVER_URL.
 _use_tunnel = bool(SPARK_IP and SPARK_USERNAME and SPARK_PASSWORD)
 
-_tunnel = None
+# One tunnel per remote port (train server, vLLM, …), each lazily opened.
+_tunnels: dict[int, object] = {}
 _tunnel_lock = threading.Lock()
 
 
-def _ensure_tunnel() -> int:
-    """Open (or reuse) the SSH tunnel; return the local forwarded port."""
-    global _tunnel
+def tunnel_port(remote_port: int) -> int:
+    """
+    Open (or reuse) an SSH tunnel to 127.0.0.1:<remote_port> on the box;
+    return the local forwarded port. Auth goes through the SSH agent/keys
+    first (like a plain `ssh`), with the configured password as fallback.
+    """
     with _tunnel_lock:
-        if _tunnel is not None:
+        t = _tunnels.get(remote_port)
+        if t is not None:
             try:
-                if _tunnel.is_active:
-                    return _tunnel.local_bind_port
+                if t.is_active:
+                    return t.local_bind_port
             except Exception:
                 pass
             try:
-                _tunnel.stop()
+                t.stop()
             except Exception:
                 pass
-            _tunnel = None
+            _tunnels.pop(remote_port, None)
 
         import sshtunnel
 
-        _tunnel = sshtunnel.SSHTunnelForwarder(
+        t = sshtunnel.SSHTunnelForwarder(
             (SPARK_IP, SPARK_SSH_PORT),
             ssh_username=SPARK_USERNAME,
             ssh_password=SPARK_PASSWORD,
-            remote_bind_address=("127.0.0.1", int(SPARK_PORT)),
+            remote_bind_address=("127.0.0.1", remote_port),
             local_bind_address=("127.0.0.1", 0),
             set_keepalive=30.0,
         )
-        _tunnel.start()
-        return _tunnel.local_bind_port
+        t.start()
+        _tunnels[remote_port] = t
+        return t.local_bind_port
 
 
 def _base_url() -> str:
     if _use_tunnel:
-        return f"http://127.0.0.1:{_ensure_tunnel()}"
+        return f"http://127.0.0.1:{tunnel_port(int(SPARK_PORT))}"
     return TRAIN_SERVER_URL
 
 
 def close_tunnel() -> None:
-    global _tunnel
     with _tunnel_lock:
-        if _tunnel is not None:
+        for t in _tunnels.values():
             try:
-                _tunnel.stop()
+                t.stop()
             except Exception:
                 pass
-            _tunnel = None
+        _tunnels.clear()
 
 
 def training_enabled() -> bool:

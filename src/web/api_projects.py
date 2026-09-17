@@ -110,6 +110,7 @@ def project_scans(project_id: int):
         flagged=_bool_arg("flagged"),
         reviewed=_bool_arg("reviewed"),
         page_type=(request.args.get("page_type") or None),
+        transcribed=_bool_arg("transcribed"),
         limit=per_page,
         offset=(page - 1) * per_page,
     )
@@ -237,6 +238,14 @@ def scan_image(scan_id: int):
     if request.args.get("full", "").lower() in ("1", "true", "yes", "on"):
         return send_file(src)
     return thumbs.serve("scan", scan_id, src)
+
+
+@bp.get("/scans/<int:scan_id>/transcriptions")
+def scan_transcriptions(scan_id: int):
+    """Every backend's reading of this scan, for the swap tabs in the viewer."""
+    if db.get_scan(scan_id) is None:
+        return jsonify({"error": "Scan not found"}), 404
+    return jsonify({"transcriptions": db.list_transcriptions(scan_id)})
 
 
 @bp.post("/scans/<int:scan_id>/verdict")

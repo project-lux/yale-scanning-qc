@@ -35,6 +35,8 @@
     <label class="check"><input type="checkbox" id="stBadscan" checked><span>Bad scan</span></label>
     <label class="check"><input type="checkbox" id="stPagetype"><span>Page type</span></label>
     <label class="check"><input type="checkbox" id="stTranscription"><span>Transcription</span></label>
+    <label class="check" title="Transcribe every page, not just the configured page types">
+      <input type="checkbox" id="stForce"><span>all page types</span></label>
     <span class="grow"></span>
     <span class="hint" id="reprocessScope">whole project</span>
     <button class="btn sm primary" id="doReprocess">Start</button>
@@ -56,7 +58,18 @@
       </select></label>
     <label class="field"><span>Page type</span>
       <select id="fPageType"><option value="">All</option></select></label>
+    <label class="field"><span>Transcription</span>
+      <select id="fTranscribed">
+        <option value="">All</option>
+        <option value="1">Transcribed</option>
+        <option value="0">Not transcribed</option>
+      </select></label>
     <span class="grow"></span>
+    <label class="field"><span>View</span>
+      <select id="fView">
+        <option value="grid">Grid</option>
+        <option value="list">Transcriptions</option>
+      </select></label>
     <label class="field"><span>Per page</span>
       <select id="fPer"><option>60</option><option>120</option><option>240</option></select></label>
   </section>
@@ -70,6 +83,7 @@
   </section>
 
   <div class="grid" id="grid"></div>
+  <div class="tlist" id="tlist" hidden></div>
   <p class="empty" id="empty" hidden>No scans match these filters. Run a pass to process this directory.</p>
   <div class="pager">
     <button class="btn sm" id="prevPage">← Previous</button>
@@ -78,33 +92,52 @@
   </div>
 </div>
 
-<!-- Review drawer -->
-<aside class="drawer" id="drawer" hidden aria-label="Scan detail">
-  <div class="drawerhead">
-    <strong id="dFilename">—</strong>
-    <button class="iconbtn" id="dClose" title="Close (Esc)">✕</button>
-  </div>
-  <div class="drawerbody">
-    <div class="dimgwrap"><img id="dImg" alt=""></div>
-    <div class="dmeta" id="dMeta"></div>
-
-    <fieldset class="dclasses">
-      <legend>Is this a bad scan? <span class="hint">b = bad, g = fine</span></legend>
-      <div class="labelbtns">
-        <button class="labelbtn" id="vBad">Bad scan <kbd>b</kbd></button>
-        <button class="labelbtn" id="vGood">Looks fine <kbd>g</kbd></button>
+<!-- Popout viewer: image + line polygons beside transcription, metadata, review -->
+<aside class="viewer" id="drawer" hidden aria-label="Scan detail">
+  <div class="viewerbox">
+    <div class="drawerhead">
+      <strong id="dFilename">—</strong>
+      <span class="hint" id="dLineHint"></span>
+      <button class="iconbtn" id="dClose" title="Close (Esc)">✕</button>
+    </div>
+    <div class="viewerbody">
+      <div class="vimg" id="vImgWrap">
+        <div class="imgstack" id="imgStack">
+          <img id="dImg" alt="">
+          <svg id="dOverlay" preserveAspectRatio="xMidYMid meet"></svg>
+        </div>
       </div>
-      <p class="hint" id="verdictHint"></p>
-    </fieldset>
+      <div class="vside">
+        <div class="dmeta" id="dMeta"></div>
 
-    <label class="field block"><span>Page type</span>
-      <select id="dPageType"><option value="">— unchanged —</option></select></label>
-    <label class="field block"><span>Notes</span>
-      <textarea id="dNotes" rows="2" placeholder="What is wrong with it…"></textarea></label>
+        <div class="dtranscript" id="dTranscript" hidden>
+          <div class="dtranshead">
+            <strong>Transcription</strong>
+            <span class="ttabs" id="dTransTabs" title="Swap between transcriptions"></span>
+            <span class="hint" id="dTranscriptBackend"></span>
+          </div>
+          <div id="dTranscriptText" class="dtlines"></div>
+        </div>
 
-    <div class="navrow">
-      <button class="btn sm" id="dPrev">← Prev (k)</button>
-      <button class="btn sm" id="dNext">Next (j) →</button>
+        <fieldset class="dclasses">
+          <legend>Is this a bad scan? <span class="hint">b = bad, g = fine</span></legend>
+          <div class="labelbtns">
+            <button class="labelbtn" id="vBad">Bad scan <kbd>b</kbd></button>
+            <button class="labelbtn" id="vGood">Looks fine <kbd>g</kbd></button>
+          </div>
+          <p class="hint" id="verdictHint"></p>
+        </fieldset>
+
+        <label class="field block"><span>Page type</span>
+          <select id="dPageType"><option value="">— unchanged —</option></select></label>
+        <label class="field block"><span>Notes</span>
+          <textarea id="dNotes" rows="2" placeholder="What is wrong with it…"></textarea></label>
+
+        <div class="navrow">
+          <button class="btn sm" id="dPrev">← Prev (k)</button>
+          <button class="btn sm" id="dNext">Next (j) →</button>
+        </div>
+      </div>
     </div>
   </div>
 </aside>

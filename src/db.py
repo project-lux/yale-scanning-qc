@@ -126,12 +126,27 @@ CREATE TABLE IF NOT EXISTS scans (
     page_type_source TEXT NOT NULL DEFAULT '',  -- 'model' | 'llm:<backend>' | ''
     transcription  TEXT,
     transcription_backend TEXT NOT NULL DEFAULT '',
+    transcription_lines TEXT,          -- JSON {w, h, lines:[{text, polygon, …}]}
     status         TEXT NOT NULL DEFAULT 'ok',  -- ok | error
     error          TEXT NOT NULL DEFAULT '',
     processed_at   TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_scans_batch ON scans(batch_id);
 CREATE INDEX IF NOT EXISTS idx_scans_path  ON scans(filepath);
+
+-- Every transcription of a scan, one row per backend/model, so different
+-- engines' readings of the same page can be compared and swapped in the UI.
+-- scans.transcription stays the "current" one (whatever ran last).
+CREATE TABLE IF NOT EXISTS transcriptions (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    scan_id    INTEGER NOT NULL REFERENCES scans(id),
+    backend    TEXT NOT NULL,       -- kraken | nara | sglang | vertex
+    text       TEXT,
+    lines      TEXT,                -- JSON line geometry (kraken only)
+    created_at TEXT NOT NULL,
+    UNIQUE(scan_id, backend)
+);
+CREATE INDEX IF NOT EXISTS idx_transcriptions_scan ON transcriptions(scan_id);
 
 CREATE TABLE IF NOT EXISTS reviews (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -230,6 +245,11 @@ def init_db() -> None:
             db.execute("ALTER TABLE training_examples ADD COLUMN verdict TEXT NOT NULL DEFAULT ''")
         except sqlite3.OperationalError:
             pass
+        # Per-line OCR geometry for the transcription overlay viewer.
+        try:
+            db.execute("ALTER TABLE scans ADD COLUMN transcription_lines TEXT")
+        except sqlite3.OperationalError:
+            pass
 
         # --- mistake -> bad_scan rename migration ---
         scan_cols = _columns(db, "scans")
@@ -275,6 +295,13 @@ def init_db() -> None:
             if len(ids) == 1:
                 db.execute("UPDATE batches SET project_id=? WHERE id=?",
                            (ids.pop(), b["id"]))
+
+        # Backfill the per-backend transcriptions table from scans recorded
+        # before it existed (INSERT OR IGNORE: reruns keep their own rows).
+        db.execute(
+            "INSERT OR IGNORE INTO transcriptions (scan_id, backend, text, lines, created_at) "
+            "SELECT id, transcription_backend, transcription, transcription_lines, processed_at "
+            "FROM scans WHERE transcription IS NOT NULL AND transcription_backend != ''")
 
         for key, value in DEFAULT_SETTINGS.items():
             db.execute(
@@ -520,16 +547,18 @@ def add_scan(batch_id: int, directory: str, filename: str, filepath: str,
              page_type: str | None = None, page_type_conf: float = 0,
              page_type_source: str = "",
              transcription: str | None = None, transcription_backend: str = "",
+             transcription_lines: str | None = None,
              status: str = "ok", error: str = "") -> int:
     with _write_lock, get_db() as db:
         cur = db.execute(
             "INSERT INTO scans (batch_id, directory, filename, filepath, jpeg_path, "
             "bad_scan, bad_scan_conf, page_type, page_type_conf, page_type_source, "
-            "transcription, transcription_backend, status, error, processed_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "transcription, transcription_backend, transcription_lines, "
+            "status, error, processed_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (batch_id, directory, filename, filepath, jpeg_path, bad_scan, bad_scan_conf,
              page_type, page_type_conf, page_type_source, transcription,
-             transcription_backend, status, error, utcnow()),
+             transcription_backend, transcription_lines, status, error, utcnow()),
         )
         return cur.lastrowid
 
@@ -556,7 +585,7 @@ def get_scan(scan_id: int) -> dict | None:
 _SCAN_UPDATE_FIELDS = {
     "jpeg_path", "bad_scan", "bad_scan_conf", "page_type", "page_type_conf",
     "page_type_source", "transcription", "transcription_backend",
-    "status", "error",
+    "transcription_lines", "status", "error",
 }
 
 
@@ -638,6 +667,32 @@ def latest_scans_by_path() -> dict[str, dict]:
             "JOIN (SELECT filepath, MAX(id) AS mid FROM scans GROUP BY filepath) t "
             "ON s.id = t.mid"))
     return {r["filepath"]: r for r in rows}
+
+
+# ---------------------------------------------------------------------------
+# Transcriptions (one per scan + backend, for side-by-side comparison)
+# ---------------------------------------------------------------------------
+
+def save_transcription(scan_id: int, backend: str, text: str | None,
+                       lines: str | None = None) -> None:
+    """Upsert one backend's reading of a scan."""
+    if not backend:
+        return
+    with _write_lock, get_db() as db:
+        db.execute(
+            "INSERT INTO transcriptions (scan_id, backend, text, lines, created_at) "
+            "VALUES (?, ?, ?, ?, ?) "
+            "ON CONFLICT(scan_id, backend) DO UPDATE SET text=excluded.text, "
+            "lines=excluded.lines, created_at=excluded.created_at",
+            (scan_id, backend, text, lines, utcnow()),
+        )
+
+
+def list_transcriptions(scan_id: int) -> list[dict]:
+    with get_db() as db:
+        return _rows(db.execute(
+            "SELECT * FROM transcriptions WHERE scan_id=? ORDER BY backend",
+            (scan_id,)))
 
 
 # ---------------------------------------------------------------------------
@@ -1087,6 +1142,7 @@ def training_example_stats(role: str) -> dict:
 
 def project_scans(project_id: int, flagged: bool | None = None,
                   reviewed: bool | None = None, page_type: str | None = None,
+                  transcribed: bool | None = None,
                   limit: int = 500, offset: int = 0) -> list[dict]:
     """
     Latest scan per file inside a project's directory, with any review.
@@ -1110,6 +1166,10 @@ def project_scans(project_id: int, flagged: bool | None = None,
     if page_type:
         where.append("s.page_type = ?")
         args.append(page_type)
+    if transcribed is True:
+        where.append("s.transcription IS NOT NULL")
+    elif transcribed is False:
+        where.append("s.transcription IS NULL")
 
     q = (
         "SELECT s.*, b.label AS batch_label, b.started_at AS batch_started, "

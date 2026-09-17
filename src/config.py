@@ -122,7 +122,13 @@ TRANSCRIBE_PAGE_TYPES = ["handwriting"]
 DEFAULT_SETTINGS = {
     "schedule_enabled": "0",
     "schedule_time": "02:00",           # HH:MM, local time, daily
-    "transcription_backend": "off",     # off | sglang | vertex
+    "transcription_backend": "off",     # off | sglang | vertex | kraken | nara
+    "kraken_model_path": str(MODELS_DIR / "kraken-ppocrv6-medium" / "medium.safetensors"),
+    "kraken_device": "mps",             # mps | cpu | auto
+    "nara_model_id": "wjbmattingly/nara-qwen-3.5-0.8b-ep1",
+    # Blank = run the VLM locally. "spark:<port>" = vLLM on the DGX through
+    # the SSH tunnel. A full http(s) URL is used as-is.
+    "nara_server_url": "",
     "sglang_base_url": "http://localhost:30000",
     "sglang_model": "default",
     "sglang_api_key": "",

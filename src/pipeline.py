@@ -8,6 +8,7 @@ records everything in the database. Each pass records the model versions
 it ran with, so passes can be repeated after retraining and compared.
 """
 
+import json
 import os
 import threading
 import traceback
@@ -352,9 +353,13 @@ def _rerun_one(scan: dict, stages: set[str], settings: dict,
                 if t.strip()
             }
             if force_transcribe or page_type in transcribe_types:
-                text, backend = transcribe.transcribe(jp, settings)
+                text, backend, geometry = transcribe.transcribe(jp, settings)
                 updates["transcription"] = text
                 updates["transcription_backend"] = backend
+                updates["transcription_lines"] = json.dumps(geometry) if geometry else None
+                if text is not None:
+                    db.save_transcription(scan["id"], backend,
+                                          text, updates["transcription_lines"])
 
         db.update_scan(scan["id"], **updates)
         return True
@@ -459,23 +464,27 @@ def _process_one(batch_id: int, root: Path, filepath: Path,
             page_type, page_conf, page_source = classify_page_full(
                 image, jp, settings, pagetype_model_id)
 
-        transcription, used_backend = None, ""
+        transcription, used_backend, geometry = None, "", None
         if page_type in transcribe_types:
             try:
-                transcription, used_backend = transcribe.transcribe(jp, settings)
+                transcription, used_backend, geometry = transcribe.transcribe(jp, settings)
             except Exception as te:
                 # Transcription failure shouldn't sink the scan record.
-                transcription, used_backend = None, ""
+                transcription, used_backend, geometry = None, "", None
                 print(f"  transcription failed for {filepath.name}: {te}")
 
-        db.add_scan(
+        lines_json = json.dumps(geometry) if geometry else None
+        scan_id = db.add_scan(
             batch_id, directory, filepath.name, str(filepath),
             jpeg_path=str(jp),
             bad_scan=bad_scan, bad_scan_conf=bad_scan_conf,
             page_type=page_type, page_type_conf=page_conf,
             page_type_source=page_source,
             transcription=transcription, transcription_backend=used_backend,
+            transcription_lines=lines_json,
         )
+        if transcription is not None:
+            db.save_transcription(scan_id, used_backend, transcription, lines_json)
     except Exception as e:
         db.add_scan(
             batch_id, directory, filepath.name, str(filepath),

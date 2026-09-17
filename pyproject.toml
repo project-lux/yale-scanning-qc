@@ -23,6 +23,9 @@ dependencies = [
     "google-genai>=1.0.0",
     "sshtunnel>=0.4.0",
     "paramiko>=3.4,<4",
+    "kraken>=7.1.0",
+    "transformers>=5.12.1",
+    "accelerate>=1.15.0",
 ]
 
 [project.optional-dependencies]
