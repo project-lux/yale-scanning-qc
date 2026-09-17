@@ -36,7 +36,8 @@ def create_project():
     if existing:
         return jsonify({"error": "That directory is already a project",
                         "project": existing}), 409
-    project = db.add_project(str(p), (data.get("name") or "").strip())
+    mode = "tree" if (data.get("mode") == "tree" or data.get("tree")) else "flat"
+    project = db.add_project(str(p), (data.get("name") or "").strip(), mode=mode)
     return jsonify({"project": project}), 201
 
 
@@ -94,10 +95,22 @@ def _bool_arg(name: str):
     return raw.lower() in ("1", "true", "yes", "on")
 
 
+def _subdir_arg(project: dict) -> str | None:
+    """Sanitized relative subdirectory filter (tree projects only)."""
+    raw = (request.args.get("dir") or "").strip().strip("/")
+    if not raw or project.get("mode") != "tree":
+        return None
+    parts = Path(raw).parts
+    if any(part in ("..", "") for part in parts) or Path(raw).is_absolute():
+        return None
+    return raw
+
+
 @bp.get("/<int:project_id>/scans")
 def project_scans(project_id: int):
     """Latest scan per file in this project, with its review if any."""
-    if db.get_project(project_id) is None:
+    project = db.get_project(project_id)
+    if project is None:
         return jsonify({"error": "Not found"}), 404
     try:
         per_page = min(500, max(1, int(request.args.get("per_page") or 60)))
@@ -105,24 +118,41 @@ def project_scans(project_id: int):
     except ValueError:
         return jsonify({"error": "page and per_page must be integers"}), 400
 
+    subdir = _subdir_arg(project)
     rows = db.project_scans(
         project_id,
         flagged=_bool_arg("flagged"),
         reviewed=_bool_arg("reviewed"),
         page_type=(request.args.get("page_type") or None),
         transcribed=_bool_arg("transcribed"),
+        subdir=subdir,
         limit=per_page,
         offset=(page - 1) * per_page,
     )
+    root = project["path"]
     for r in rows:
         r["filename"] = Path(r["filepath"]).name
         r["has_jpeg"] = bool(r["jpeg_path"]) and Path(r["jpeg_path"]).exists()
+        if project.get("mode") == "tree":
+            try:
+                r["relpath"] = str(Path(r["filepath"]).relative_to(root))
+            except ValueError:
+                r["relpath"] = r["filename"]
     return jsonify({
         "scans": rows,
         "page": page,
         "per_page": per_page,
-        "counts": db.project_scan_counts(project_id),
+        "counts": db.project_scan_counts(project_id, subdir=subdir),
     })
+
+
+@bp.get("/<int:project_id>/dirs")
+def project_dirs(project_id: int):
+    """Subdirectories (with scan counts) for the tree project's dir filter."""
+    p = db.get_project(project_id)
+    if p is None:
+        return jsonify({"error": "Not found"}), 404
+    return jsonify({"dirs": db.project_directories(project_id)})
 
 
 @bp.get("/<int:project_id>/progress")
@@ -238,6 +268,53 @@ def scan_image(scan_id: int):
     if request.args.get("full", "").lower() in ("1", "true", "yes", "on"):
         return send_file(src)
     return thumbs.serve("scan", scan_id, src)
+
+
+@bp.post("/<int:project_id>/bulk-verdict")
+def bulk_verdict(project_id: int):
+    """
+    Review many scans at once with the same plain answer — "these are bad
+    scans" / "these look fine". Each scan still gets its own TP/FP/FN/TN
+    verdict derived from what the model said about it, and every verdict
+    becomes training data immediately (same path as a single review).
+    """
+    from flask import session
+
+    from .. import examples
+    from ..config import all_page_types
+
+    if db.get_project(project_id) is None:
+        return jsonify({"error": "Not found"}), 404
+    data = request.get_json(force=True, silent=True) or {}
+    if "is_bad" not in data:
+        return jsonify({"error": "is_bad (true/false) is required"}), 400
+    ids = [int(i) for i in (data.get("scan_ids") or [])]
+    if not ids:
+        return jsonify({"error": "scan_ids is required"}), 400
+    is_bad = bool(data["is_bad"])
+
+    page_type = (data.get("page_type") or "").strip() or None
+    if page_type is not None and page_type not in all_page_types(db.get_settings()):
+        return jsonify({"error": f"Invalid page type: {page_type}"}), 400
+
+    reviewer = session.get("user", "")
+    notes = (data.get("notes") or "").strip()
+    reviewed = 0
+    for sid in ids:
+        scan = db.get_scan(sid)
+        if scan is None:
+            continue
+        flagged = scan["bad_scan"] == "bad_scan"
+        verdict = ("true_positive" if is_bad else "false_positive") if flagged \
+            else ("false_negative" if is_bad else "true_negative")
+        db.save_review(sid, verdict, page_type=page_type, notes=notes,
+                       reviewer=reviewer)
+        reviewed += 1
+
+    examples.sync("badscan")
+    if page_type:
+        examples.sync("pagetype")
+    return jsonify({"reviewed": reviewed, "is_bad": is_bad})
 
 
 @bp.get("/scans/<int:scan_id>/transcriptions")

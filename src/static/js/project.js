@@ -5,6 +5,7 @@
 
   const root = $('projectRoot');
   const PID = Number(root.dataset.projectId);
+  const TREE = root.dataset.mode === 'tree';
   const PAGE_TYPES = (root.dataset.pageTypes || '').split(',').filter(Boolean);
 
   const state = {
@@ -25,6 +26,7 @@
     if ($('fReviewed').value) p.set('reviewed', $('fReviewed').value);
     if ($('fPageType').value) p.set('page_type', $('fPageType').value);
     if ($('fTranscribed').value) p.set('transcribed', $('fTranscribed').value);
+    if (TREE && $('fDir').value) p.set('dir', $('fDir').value);
     return p.toString();
   }
 
@@ -98,7 +100,7 @@
           ${img}
           <div class="tmeta">
             <div class="badges">${badgesFor(r)}</div>
-            <div class="fname" title="${esc(r.filepath)}">${esc(r.filename)}</div>
+            <div class="fname" title="${esc(r.filepath)}">${esc(r.relpath || r.filename)}</div>
           </div>
         </div>`;
     }).join('');
@@ -125,7 +127,7 @@
           </div>
           <div class="tbody">
             <div class="trowhead">
-              <span class="fname" title="${esc(r.filepath)}">${esc(r.filename)}</span>
+              <span class="fname" title="${esc(r.filepath)}">${esc(r.relpath || r.filename)}</span>
               <span class="badges">
                 ${badgesFor(r)}
                 ${rev ? `<span class="tag rev">reviewed: ${esc(rev)}</span>` : ''}
@@ -378,6 +380,7 @@
           setRunning(false);
           toast('Finished');
           load();
+          loadDirs();
           return;
         }
         const total = p.total || 0;
@@ -389,6 +392,57 @@
       } catch { /* transient; keep polling */ }
     }, 1200);
   }
+
+  /* Subdirectory filter for tree projects: pick a branch or stay at the
+     top ("All directories"). Reloaded after every pass/rescan so new
+     folders show up. */
+  async function loadDirs() {
+    if (!TREE) return;
+    try {
+      const d = await get(`/api/projects/${PID}/dirs`);
+      const dirs = (d.dirs || []).filter((x) => x.dir);
+      const cur = $('fDir').value;
+      $('fDir').innerHTML = '<option value="">All directories</option>' + dirs.map((x) => {
+        const depth = x.dir.split('/').length - 1;
+        const label = `${'  '.repeat(depth)}${x.dir.split('/').pop()} (${x.n})`;
+        return `<option value="${esc(x.dir)}">${label}</option>`;
+      }).join('');
+      if ([...$('fDir').options].some((o) => o.value === cur)) $('fDir').value = cur;
+      $('dirFilterWrap').hidden = false;
+    } catch { /* filter stays hidden */ }
+  }
+
+  const rescanBtn = document.getElementById('rescanBtn');
+  if (rescanBtn) {
+    rescanBtn.addEventListener('click', async () => {
+      try {
+        await post(`/api/projects/${PID}/run`, { all: false });
+        setRunning(true, 'Rescanning directory', 'looking for new images…', 0);
+        startPolling();
+      } catch (e) { toast(e.message, true); }
+    });
+  }
+
+  /* Bulk review: same plain answer applied to every selected scan. */
+  async function bulkVerdict(isBad) {
+    const ids = [...state.selected];
+    if (!ids.length) { toast('Select some scans first', true); return; }
+    const what = isBad ? 'bad scans' : 'fine';
+    if (!confirm(`Mark ${ids.length} selected scan(s) as ${what}?\n\n`
+      + 'Each becomes a review and immediate training data.')) return;
+    try {
+      const d = await post(`/api/projects/${PID}/bulk-verdict`, {
+        scan_ids: ids,
+        is_bad: isBad,
+        page_type: $('bulkPageType').value || null,
+      });
+      toast(`Reviewed ${d.reviewed} scan(s) as ${what}`);
+      state.selected.clear();
+      load();
+    } catch (e) { toast(e.message, true); }
+  }
+  $('bulkBad').addEventListener('click', () => bulkVerdict(true));
+  $('bulkGood').addEventListener('click', () => bulkVerdict(false));
 
   $('runBtn').addEventListener('click', async () => {
     const all = confirm('Run a pass on this project.\n\n'
@@ -461,7 +515,7 @@
   });
   $('selNone').addEventListener('click', () => { state.selected.clear(); render(); });
 
-  ['fFlagged', 'fReviewed', 'fPageType', 'fTranscribed'].forEach((id) =>
+  ['fFlagged', 'fReviewed', 'fPageType', 'fTranscribed', 'fDir'].forEach((id) =>
     $(id).addEventListener('change', () => { state.page = 1; load(); }));
   $('fView').value = state.view;
   $('fView').addEventListener('change', (ev) => {
@@ -493,8 +547,10 @@
   const opts = PAGE_TYPES.map((t) => `<option value="${esc(t)}">${esc(pretty(t))}</option>`).join('');
   $('fPageType').innerHTML = '<option value="">All</option>' + opts;
   $('dPageType').innerHTML = '<option value="">— unchanged —</option>' + opts;
+  $('bulkPageType').innerHTML = '<option value="">— unchanged —</option>' + opts;
 
   load();
+  loadDirs();
   // A pass may already be running when the page opens.
   get(`/api/projects/${PID}/progress`).then((d) => { if (d.running) startPolling(); }).catch(() => {});
 })();

@@ -4,16 +4,23 @@
 {% block content %}
 <div id="projectRoot"
      data-project-id="{{ project.id }}"
+     data-mode="{{ project.mode or 'flat' }}"
      data-page-types="{{ page_types | join(',') }}">
 
   <div class="pagehead">
     <div>
-      <h1>{{ project.name }}</h1>
+      <h1>{{ project.name }}
+        {% if project.mode == 'tree' %}<span class="tag src" title="This project mirrors the whole directory tree">directory tree</span>{% endif %}
+      </h1>
       <p class="sub" title="{{ project.path }}">{{ project.path }}</p>
     </div>
     <div class="headactions">
       <a class="btn" href="/data?project={{ project.id }}">Training data</a>
       <button class="btn" id="reprocessBtn">Reprocess…</button>
+      {% if project.mode == 'tree' %}
+      <button class="btn" id="rescanBtn"
+              title="Re-walk the directory tree and process any new images">Rescan directory</button>
+      {% endif %}
       <button class="btn primary" id="runBtn">Run pass</button>
     </div>
   </div>
@@ -44,6 +51,8 @@
   </section>
 
   <section class="filters">
+    <label class="field" id="dirFilterWrap" hidden><span>Directory</span>
+      <select id="fDir"><option value="">All directories</option></select></label>
     <label class="field"><span>Model verdict</span>
       <select id="fFlagged">
         <option value="">All</option>
@@ -79,6 +88,12 @@
     <button class="btn sm" id="selAll">Select page</button>
     <button class="btn sm" id="selNone">Clear</button>
     <span class="grow"></span>
+    <label class="field"><span>Page type</span>
+      <select id="bulkPageType"><option value="">— unchanged —</option></select></label>
+    <button class="btn sm danger" id="bulkBad"
+            title="Review every selected scan as a bad scan; each becomes training data">Flag bad scan</button>
+    <button class="btn sm" id="bulkGood"
+            title="Review every selected scan as fine; each becomes training data">Mark fine</button>
     <button class="btn sm" id="bulkReprocess">Reprocess selected…</button>
   </section>
 

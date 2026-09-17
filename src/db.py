@@ -37,6 +37,10 @@ CREATE TABLE IF NOT EXISTS projects (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     name       TEXT NOT NULL,
     path       TEXT NOT NULL UNIQUE,
+    -- 'flat': scans of the directory itself. 'tree': the project mirrors the
+    -- whole directory tree — subfolders can be browsed/filtered in the UI
+    -- and a rescan pulls in images added anywhere under the root.
+    mode       TEXT NOT NULL DEFAULT 'flat',
     enabled    INTEGER NOT NULL DEFAULT 1,
     notes      TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL
@@ -248,6 +252,10 @@ def init_db() -> None:
         # Per-line OCR geometry for the transcription overlay viewer.
         try:
             db.execute("ALTER TABLE scans ADD COLUMN transcription_lines TEXT")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            db.execute("ALTER TABLE projects ADD COLUMN mode TEXT NOT NULL DEFAULT 'flat'")
         except sqlite3.OperationalError:
             pass
 
@@ -913,15 +921,32 @@ def get_project_by_path(path: str) -> dict | None:
         return dict(row) if row else None
 
 
-def add_project(path: str, name: str = "") -> dict:
+def add_project(path: str, name: str = "", mode: str = "flat") -> dict:
     path = str(path)
     with _write_lock, get_db() as db:
         db.execute(
-            "INSERT OR IGNORE INTO projects (name, path, enabled, created_at) "
-            "VALUES (?, ?, 1, ?)",
-            (name or Path(path).name or path, path, utcnow()),
+            "INSERT OR IGNORE INTO projects (name, path, mode, enabled, created_at) "
+            "VALUES (?, ?, ?, 1, ?)",
+            (name or Path(path).name or path, path,
+             mode if mode in ("flat", "tree") else "flat", utcnow()),
         )
     return get_project_by_path(path)
+
+
+def _project_dir_clause(project: dict, subdir: str | None = None) -> tuple[str, list]:
+    """
+    WHERE fragment matching scans that belong to *project* (alias ``s``).
+
+    Flat projects own only files directly in their directory. Tree projects
+    own the whole subtree; *subdir* (a relative path) narrows the match to
+    one branch — filtering "at the highest level" is simply subdir=None.
+    """
+    if project.get("mode") == "tree":
+        base = project["path"]
+        if subdir:
+            base = str(Path(base) / subdir)
+        return "(s.directory = ? OR s.directory LIKE ? || '/%')", [base, base]
+    return "s.directory = ?", [project["path"]]
 
 
 def update_project(project_id: int, **fields) -> None:
@@ -948,16 +973,17 @@ def project_stats(project_id: int) -> dict:
     p = get_project(project_id)
     if p is None:
         return {}
+    clause, args = _project_dir_clause(p)
     with get_db() as db:
         scans = db.execute(
             "SELECT COUNT(*) n, "
-            "SUM(bad_scan='bad_scan') n_bad, "
-            "SUM(bad_scan IS NULL) n_unknown "
-            "FROM scans WHERE directory=?", (p["path"],)
+            "SUM(s.bad_scan='bad_scan') n_bad, "
+            "SUM(s.bad_scan IS NULL) n_unknown "
+            f"FROM scans s WHERE {clause}", args
         ).fetchone()
         reviewed = db.execute(
             "SELECT COUNT(*) n FROM reviews r JOIN scans s ON s.id=r.scan_id "
-            "WHERE s.directory=?", (p["path"],)
+            f"WHERE {clause}", args
         ).fetchone()
         examples = db.execute(
             "SELECT COUNT(*) n FROM training_examples "
@@ -1142,19 +1168,21 @@ def training_example_stats(role: str) -> dict:
 
 def project_scans(project_id: int, flagged: bool | None = None,
                   reviewed: bool | None = None, page_type: str | None = None,
-                  transcribed: bool | None = None,
+                  transcribed: bool | None = None, subdir: str | None = None,
                   limit: int = 500, offset: int = 0) -> list[dict]:
     """
     Latest scan per file inside a project's directory, with any review.
 
     This is the project detail grid. Only the newest pass per file is
-    returned, so re-running does not duplicate rows.
+    returned, so re-running does not duplicate rows. For tree projects,
+    *subdir* narrows the grid to one branch of the directory tree.
     """
     p = get_project(project_id)
     if p is None:
         return []
-    where = ["s.directory = ?"]
-    args: list = [p["path"]]
+    clause, args = _project_dir_clause(p, subdir)
+    where = [clause]
+    args = list(args)
     if flagged is True:
         where.append("(s.bad_scan='bad_scan' OR r.verdict='false_negative')")
     elif flagged is False:
@@ -1188,11 +1216,12 @@ def project_scans(project_id: int, flagged: bool | None = None,
         return _rows(db.execute(q, args))
 
 
-def project_scan_counts(project_id: int) -> dict:
+def project_scan_counts(project_id: int, subdir: str | None = None) -> dict:
     """Counts for the project grid's filter chips (latest pass per file)."""
     p = get_project(project_id)
     if p is None:
         return {}
+    clause, args = _project_dir_clause(p, subdir)
     with get_db() as db:
         row = db.execute(
             "SELECT COUNT(*) total, "
@@ -1206,5 +1235,31 @@ def project_scan_counts(project_id: int) -> dict:
             "JOIN (SELECT filepath, MAX(id) AS mid FROM scans GROUP BY filepath) t "
             "  ON s.id = t.mid "
             "LEFT JOIN reviews r ON r.scan_id = s.id "
-            "WHERE s.directory = ?", (p["path"],)).fetchone()
+            f"WHERE {clause}", args).fetchone()
     return {k: (row[k] or 0) for k in row.keys()}
+
+
+def project_directories(project_id: int) -> list[dict]:
+    """
+    Distinct scan directories of a tree project as relative paths with
+    per-branch counts — feeds the subdirectory filter in the UI.
+    """
+    p = get_project(project_id)
+    if p is None:
+        return []
+    clause, args = _project_dir_clause(p)
+    root = p["path"]
+    with get_db() as db:
+        rows = _rows(db.execute(
+            "SELECT s.directory, COUNT(*) n, "
+            " SUM(s.bad_scan='bad_scan') n_bad "
+            "FROM scans s "
+            "JOIN (SELECT filepath, MAX(id) AS mid FROM scans GROUP BY filepath) t "
+            "  ON s.id = t.mid "
+            f"WHERE {clause} GROUP BY s.directory ORDER BY s.directory", args))
+    out = []
+    for r in rows:
+        rel = "" if r["directory"] == root else str(
+            Path(r["directory"]).relative_to(root))
+        out.append({"dir": rel, "n": r["n"] or 0, "n_bad": r["n_bad"] or 0})
+    return out

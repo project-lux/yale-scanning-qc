@@ -21,7 +21,8 @@
         : 'never';
       return `
         <div class="card ${p.enabled ? '' : 'off'}" data-id="${p.id}">
-          <h3><a href="/project/${p.id}">${esc(p.name)}</a></h3>
+          <h3><a href="/project/${p.id}">${esc(p.name)}</a>
+            ${p.mode === 'tree' ? '<span class="tag src" title="Mirrors the whole directory tree">tree</span>' : ''}</h3>
           <div class="path" title="${esc(p.path)}">${esc(p.path)}</div>
           ${p.exists ? '' : '<div class="warnrow">Directory not reachable right now</div>'}
           <div class="nums">
@@ -72,7 +73,10 @@
     const path = $('newPath').value.trim();
     if (!path) { toast('Enter a directory path', true); return; }
     try {
-      await post('/api/projects', { path });
+      await post('/api/projects', {
+        path,
+        mode: $('newTree').checked ? 'tree' : 'flat',
+      });
       $('newPath').value = '';
       toast('Project added');
       load();
