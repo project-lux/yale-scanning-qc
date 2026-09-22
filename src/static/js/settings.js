@@ -39,6 +39,9 @@
       ['nara_server_url', 'NARA vLLM server',
        'Blank = run locally. "spark:8061" = vLLM on the DGX via the SSH '
        + 'tunnel. Or a full http(s) URL.'],
+      ['transcribe_concurrency', 'Pages at a time',
+       'Concurrent transcription requests against a server backend '
+       + '(vLLM/SGLang/Vertex). Local engines always run one at a time.'],
       ['sglang_base_url', 'SGLang URL', ''],
       ['sglang_model', 'SGLang model', ''],
       ['sglang_api_key', 'SGLang API key', ''],

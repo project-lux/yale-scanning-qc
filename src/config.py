@@ -129,6 +129,10 @@ DEFAULT_SETTINGS = {
     # Blank = run the VLM locally. "spark:<port>" = vLLM on the DGX through
     # the SSH tunnel. A full http(s) URL is used as-is.
     "nara_server_url": "",
+    # Pages transcribed at once against a server backend (vLLM/SGLang/
+    # Vertex batch concurrent requests). Local engines always run one page
+    # at a time regardless of this value.
+    "transcribe_concurrency": "6",
     "sglang_base_url": "http://localhost:30000",
     "sglang_model": "default",
     "sglang_api_key": "",

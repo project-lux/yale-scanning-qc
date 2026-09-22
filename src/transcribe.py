@@ -114,6 +114,26 @@ BACKENDS = {
 LLM_BACKENDS = ("sglang", "vertex")
 
 
+def max_concurrency(settings: dict) -> int:
+    """
+    How many pages may be transcribed at once.
+
+    Server backends (vLLM/SGLang/Vertex) batch concurrent requests on the
+    server, so issuing several at a time is the correct way to use them —
+    one-at-a-time leaves the GPU mostly idle. The local engines (kraken,
+    in-process nara) run single-file behind a module lock, so they get 1.
+    """
+    backend = settings.get("transcription_backend", "off")
+    is_server = backend in LLM_BACKENDS or (
+        backend == "nara" and bool((settings.get("nara_server_url") or "").strip()))
+    if not is_server:
+        return 1
+    try:
+        return max(1, min(32, int(settings.get("transcribe_concurrency") or 6)))
+    except ValueError:
+        return 6
+
+
 def transcribe(jpeg_path: Path, settings: dict) -> tuple[str | None, str, dict | None]:
     """
     Transcribe using the configured backend.

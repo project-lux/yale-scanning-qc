@@ -94,13 +94,13 @@ def _collect_work(directories: list[str], rerun_of: int | None,
         # Explicit file list (folder- or image-level run from the
         # Directories view). No seen-filter: re-running processed files
         # deliberately produces fresh scan records in the new batch.
-        roots = [Path(d["path"]) for d in db.list_directories()]
+        roots = [Path(p["path"]) for p in db.list_projects()]
         return [(_find_root(p, roots), p)
                 for p in (Path(x) for x in paths) if p.exists()]
 
     if rerun_of is not None:
         # Re-pass: same file set as the original batch (files still on disk).
-        roots = [Path(d["path"]) for d in db.list_directories()]
+        roots = [Path(p["path"]) for p in db.list_projects()]
         file_paths = [Path(s["filepath"]) for s in db.list_scans(rerun_of)]
         return [(_find_root(p, roots), p) for p in file_paths if p.exists()]
 
@@ -120,7 +120,7 @@ def preview_work(directories: list[str] | None = None) -> dict:
     holds and how many are new (never processed). No side effects.
     """
     if directories is None:
-        directories = [d["path"] for d in db.list_directories(enabled_only=True)]
+        directories = [p["path"] for p in db.list_projects(enabled_only=True)]
     seen = db.already_scanned_paths()
 
     dirs = []
@@ -161,7 +161,7 @@ def run_batch(trigger: str = "manual", directories: list[str] | None = None,
         _cancel.clear()
         settings = db.get_settings()
         if directories is None:
-            directories = [d["path"] for d in db.list_directories(enabled_only=True)]
+            directories = [p["path"] for p in db.list_projects(enabled_only=True)]
 
         if badscan_model_id is None:
             active = db.get_active_model("badscan")
@@ -196,6 +196,8 @@ def run_batch(trigger: str = "manual", directories: list[str] | None = None,
         if work and _remote_inference_enabled():
             remote_preds = _remote_infer_all(work, badscan_model_id, pagetype_model_id)
 
+        backend_on = settings.get("transcription_backend", "off") not in ("", "off")
+        pending: list[tuple[int, Path]] = []
         cancelled = False
         for root, filepath in work:
             if _cancel.is_set():
@@ -203,10 +205,16 @@ def run_batch(trigger: str = "manual", directories: list[str] | None = None,
                 break
             progress["current"] = filepath.name
             pre = remote_preds.get(str(filepath)) if remote_preds is not None else None
-            _process_one(batch_id, root, filepath, transcribe_types, settings,
-                         badscan_model_id, pagetype_model_id,
-                         remote_pre=pre, remote_mode=remote_preds is not None)
+            res = _process_one(batch_id, root, filepath, settings,
+                               badscan_model_id, pagetype_model_id,
+                               remote_pre=pre, remote_mode=remote_preds is not None)
+            if res and backend_on and res[2] in transcribe_types:
+                pending.append((res[0], res[1]))
             progress["done"] += 1
+
+        if not cancelled:
+            _transcribe_many(pending, settings)
+            cancelled = _cancel.is_set()
 
         db.finish_batch(batch_id, status="cancelled" if cancelled else "done")
         progress = {}
@@ -284,12 +292,51 @@ def rerun_stages(scan_ids: list[int], stages: set[str],
     try:
         _cancel.clear()
         settings = db.get_settings()
-        roots = [Path(d["path"]) for d in db.list_directories()]
+        roots = [Path(p["path"]) for p in db.list_projects()]
         stage_label = "+".join(sorted(stages))
 
         progress = {"total": len(scan_ids), "done": 0, "current": "",
                     "status": "running", "stage_rerun": stage_label}
         print(f"[stage-rerun] {stage_label}: {len(scan_ids)} scan(s)")
+
+        # Transcription-only rerun: collect the work, then transcribe it
+        # through _transcribe_many so a server backend gets concurrent
+        # requests instead of one page at a time.
+        if stages == {"transcription"}:
+            transcribe_types = {
+                t.strip() for t in settings.get("transcribe_page_types", "handwriting").split(",")
+                if t.strip()
+            }
+            items: list[tuple[int, Path]] = []
+            touched: set[int] = set()
+            for sid in scan_ids:
+                scan = db.get_scan(sid)
+                if scan is None:
+                    continue
+                fp = Path(scan["filepath"])
+                if not fp.exists():
+                    db.update_scan(sid, status="error", error="File no longer exists")
+                    touched.add(scan["batch_id"])
+                    continue
+                if not (force_transcribe or scan["page_type"] in transcribe_types):
+                    continue
+                try:
+                    jp = _ensure_jpeg(_find_root(fp, roots), fp)
+                except Exception as e:
+                    db.update_scan(sid, status="error", error=str(e))
+                    touched.add(scan["batch_id"])
+                    continue
+                items.append((sid, jp))
+                touched.add(scan["batch_id"])
+
+            updated = _transcribe_many(items, settings)
+            cancelled = _cancel.is_set()
+            for bid in touched:
+                db.refresh_batch_stats(bid)
+            progress = {}
+            print(f"[stage-rerun] {'cancelled' if cancelled else 'done'} "
+                  f"({updated} transcribed)")
+            return {"updated": updated, "cancelled": cancelled}
 
         touched_batches: set[int] = set()
         updated = 0
@@ -441,11 +488,16 @@ def _remote_infer_all(work: list, badscan_model_id, pagetype_model_id,
     return preds
 
 
-def _process_one(batch_id: int, root: Path, filepath: Path,
-                 transcribe_types: set[str], settings: dict,
+def _process_one(batch_id: int, root: Path, filepath: Path, settings: dict,
                  badscan_model_id: int | None = None,
                  pagetype_model_id: int | None = None,
-                 remote_pre: dict | None = None, remote_mode: bool = False) -> None:
+                 remote_pre: dict | None = None,
+                 remote_mode: bool = False) -> tuple[int, Path, str | None] | None:
+    """
+    Classify one file and record its scan row (transcription left empty —
+    the batch transcribes afterwards, concurrently where the backend
+    allows). Returns (scan_id, jpeg_path, page_type), or None on error.
+    """
     directory = str(filepath.parent)
     try:
         jp = _ensure_jpeg(root, filepath)
@@ -464,29 +516,75 @@ def _process_one(batch_id: int, root: Path, filepath: Path,
             page_type, page_conf, page_source = classify_page_full(
                 image, jp, settings, pagetype_model_id)
 
-        transcription, used_backend, geometry = None, "", None
-        if page_type in transcribe_types:
-            try:
-                transcription, used_backend, geometry = transcribe.transcribe(jp, settings)
-            except Exception as te:
-                # Transcription failure shouldn't sink the scan record.
-                transcription, used_backend, geometry = None, "", None
-                print(f"  transcription failed for {filepath.name}: {te}")
-
-        lines_json = json.dumps(geometry) if geometry else None
         scan_id = db.add_scan(
             batch_id, directory, filepath.name, str(filepath),
             jpeg_path=str(jp),
             bad_scan=bad_scan, bad_scan_conf=bad_scan_conf,
             page_type=page_type, page_type_conf=page_conf,
             page_type_source=page_source,
-            transcription=transcription, transcription_backend=used_backend,
-            transcription_lines=lines_json,
         )
-        if transcription is not None:
-            db.save_transcription(scan_id, used_backend, transcription, lines_json)
+        return scan_id, jp, page_type
     except Exception as e:
         db.add_scan(
             batch_id, directory, filepath.name, str(filepath),
             status="error", error=str(e),
         )
+        return None
+
+
+def _transcribe_many(items: list[tuple[int, Path]], settings: dict) -> int:
+    """
+    Transcribe (scan_id, jpeg_path) pairs and store each result on the scan
+    and in the per-backend transcriptions table.
+
+    Runs transcribe.max_concurrency(settings) pages at a time: a vLLM /
+    SGLang / Vertex endpoint batches concurrent requests on the server, so
+    parallel in-flight requests are what keeps its GPU busy. Local engines
+    are declared with concurrency 1 and run exactly as before. Failures
+    are per-page and never sink the pass; cancellation is honoured between
+    pages. Returns how many pages got a transcription.
+    """
+    if not items:
+        return 0
+    from concurrent.futures import ThreadPoolExecutor
+
+    global progress
+    workers = min(transcribe.max_concurrency(settings), len(items))
+    progress.update(total=len(items), done=0,
+                    status=f"transcribing ({workers} at a time)")
+    print(f"  transcribing {len(items)} page(s), {workers} at a time")
+    done_lock = threading.Lock()
+    n_ok = 0
+
+    def one(item: tuple[int, Path]) -> bool:
+        nonlocal n_ok
+        sid, jp = item
+        if _cancel.is_set():
+            return False
+        progress["current"] = jp.name
+        ok = False
+        try:
+            text, backend, geometry = transcribe.transcribe(jp, settings)
+            lines_json = json.dumps(geometry) if geometry else None
+            db.update_scan(sid, transcription=text,
+                           transcription_backend=backend,
+                           transcription_lines=lines_json)
+            if text is not None:
+                db.save_transcription(sid, backend, text, lines_json)
+                ok = True
+        except Exception as te:
+            print(f"  transcription failed for {jp.name}: {te}")
+        with done_lock:
+            progress["done"] += 1
+            if ok:
+                n_ok += 1
+        return ok
+
+    if workers == 1:
+        for item in items:
+            one(item)
+    else:
+        with ThreadPoolExecutor(max_workers=workers,
+                                thread_name_prefix="transcribe") as pool:
+            list(pool.map(one, items))
+    return n_ok
