@@ -8,10 +8,11 @@ templates under ``src/templates``, and per-page JS under ``src/static``.
 
 from .api_examples import bp as examples_bp
 from .api_projects import bp as projects_bp
+from .api_records import bp as records_bp
 from .api_training import bp as training_bp
 from .views import bp as views_bp
 
-BLUEPRINTS = (projects_bp, examples_bp, training_bp, views_bp)
+BLUEPRINTS = (projects_bp, examples_bp, records_bp, training_bp, views_bp)
 
 
 def register(app) -> None:

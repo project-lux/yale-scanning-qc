@@ -87,46 +87,66 @@ def _find_root(filepath: Path, roots: list[Path]) -> Path:
     return filepath.parent
 
 
+def _sweep(directories: list[str]) -> dict[str, set[str]]:
+    """Every image path currently under each reachable root."""
+    out: dict[str, set[str]] = {}
+    for d in directories:
+        root = Path(d)
+        if root.is_dir():
+            out[d] = {str(f) for f in discover_files(root)}
+    return out
+
+
 def _collect_work(directories: list[str], rerun_of: int | None,
-                  paths: list[str] | None = None) -> list[tuple[Path, Path]]:
-    """(monitored_root, filepath) pairs to process."""
+                  paths: list[str] | None = None
+                  ) -> tuple[list[tuple[Path, Path]], dict[str, set[str]] | None]:
+    """
+    (monitored_root, filepath) pairs to process, plus — for a directory
+    sweep — every image path seen under each root, so the pass can record
+    which earlier scans are no longer on disk.
+    """
     if paths is not None:
         # Explicit file list (folder- or image-level run from the
         # Directories view). No seen-filter: re-running processed files
         # deliberately produces fresh scan records in the new batch.
         roots = [Path(p["path"]) for p in db.list_projects()]
         return [(_find_root(p, roots), p)
-                for p in (Path(x) for x in paths) if p.exists()]
+                for p in (Path(x) for x in paths) if p.exists()], None
 
     if rerun_of is not None:
         # Re-pass: same file set as the original batch (files still on disk).
         roots = [Path(p["path"]) for p in db.list_projects()]
         file_paths = [Path(s["filepath"]) for s in db.list_scans(rerun_of)]
-        return [(_find_root(p, roots), p) for p in file_paths if p.exists()]
+        return [(_find_root(p, roots), p) for p in file_paths if p.exists()], None
 
-    seen = db.already_scanned_paths()
+    # A file is due when it has never been processed OR has been replaced
+    # since (a re-capture lands at the same path with a new size/mtime —
+    # the staging folder is churned, not append-only).
+    seen = db.scanned_file_versions()
+    discovered = _sweep(directories)
     work: list[tuple[Path, Path]] = []
-    for d in directories:
+    for d, found in discovered.items():
         root = Path(d)
-        for f in discover_files(root):
-            if str(f) not in seen:
+        for f in sorted(Path(x) for x in found):
+            if db.file_changed(f, seen.get(str(f))):
                 work.append((root, f))
-    return work
+    return work, discovered
 
 
 def preview_work(directories: list[str] | None = None) -> dict:
     """
     Dry-run directory scan: how many images each monitored directory
-    holds and how many are new (never processed). No side effects.
+    holds and how many are due (never processed, or replaced since). No
+    side effects.
     """
     if directories is None:
         directories = [p["path"] for p in db.list_projects(enabled_only=True)]
-    seen = db.already_scanned_paths()
+    seen = db.scanned_file_versions()
 
     dirs = []
     for d in directories:
         files = discover_files(Path(d))
-        new = sum(1 for f in files if str(f) not in seen)
+        new = sum(1 for f in files if db.file_changed(f, seen.get(str(f))))
         dirs.append({"path": d, "total": len(files), "new": new})
     return {
         "directories": dirs,
@@ -181,7 +201,16 @@ def run_batch(trigger: str = "manual", directories: list[str] | None = None,
             project_id=project_id,
         )
 
-        work = _collect_work(directories, rerun_of, paths)
+        work, discovered = _collect_work(directories, rerun_of, paths)
+        if discovered is None and rerun_of is None:
+            discovered = _sweep(directories)
+        # Record what is (and is no longer) in the watched folders before
+        # the long part, so the grid reflects the folder straight away.
+        for d, found in (discovered or {}).items():
+            moved = db.mark_presence(d, found)
+            if moved["gone"] or moved["returned"]:
+                print(f"[batch {batch_id}] {d}: {moved['gone']} file(s) gone, "
+                      f"{moved['returned']} back")
         transcribe_types = {
             t.strip() for t in settings.get("transcribe_page_types", "handwriting").split(",")
             if t.strip()
@@ -218,6 +247,9 @@ def run_batch(trigger: str = "manual", directories: list[str] | None = None,
 
         db.finish_batch(batch_id, status="cancelled" if cancelled else "done")
         progress = {}
+        from . import similarity
+
+        similarity.index_missing_async()
         print(f"[batch {batch_id}] {'cancelled' if cancelled else 'done'}")
         return batch_id
 
@@ -315,8 +347,8 @@ def rerun_stages(scan_ids: list[int], stages: set[str],
                     continue
                 fp = Path(scan["filepath"])
                 if not fp.exists():
-                    db.update_scan(sid, status="error", error="File no longer exists")
-                    touched.add(scan["batch_id"])
+                    # Moved on from the staging folder: nothing to redo.
+                    db.set_scan_present(sid, False)
                     continue
                 if not (force_transcribe or scan["page_type"] in transcribe_types):
                     continue
@@ -368,8 +400,10 @@ def _rerun_one(scan: dict, stages: set[str], settings: dict,
                roots: list[Path], force_transcribe: bool) -> bool:
     filepath = Path(scan["filepath"])
     if not filepath.exists():
-        db.update_scan(scan["id"], status="error", error="File no longer exists")
-        return True
+        # Moved on from the staging folder: nothing to redo, and not an
+        # error. Its recorded result (and any kept copy) stays as it was.
+        db.set_scan_present(scan["id"], False)
+        return False
 
     try:
         root = _find_root(filepath, roots)
@@ -431,6 +465,10 @@ def _deployed_versions(badscan_model_id, pagetype_model_id) -> dict[str, str]:
     out = {}
     for role, mid in (("badscan", badscan_model_id), ("pagetype", pagetype_model_id)):
         rec = db.get_model(mid) if mid else db.get_active_model(role)
+        if rec and inference.is_detector(role, rec["id"]):
+            # The remote /infer endpoint only classifies; a detector runs
+            # here (a nano detector is quick enough on the Mac).
+            continue
         if rec and inference.model_ready(role, rec["id"]) and Path(rec["path"]).exists():
             try:
                 remote.ensure_model(rec["version"], Path(rec["path"]))
@@ -500,14 +538,27 @@ def _process_one(batch_id: int, root: Path, filepath: Path, settings: dict,
     """
     directory = str(filepath.parent)
     try:
+        st = filepath.stat()
+        ident = {"file_size": st.st_size, "file_mtime": st.st_mtime}
+    except OSError:
+        ident = {}
+    try:
         jp = _ensure_jpeg(root, filepath)
 
         if remote_mode:
             pre = remote_pre or {}
             bad_scan, bad_scan_conf = pre.get("badscan", (None, 0.0))
-            page_type, page_conf, page_source = classify_page_full(
-                None, jp, settings, pagetype_model_id,
-                precomputed=pre.get("pagetype", (None, 0.0)))
+            if "pagetype" in pre:
+                page_type, page_conf, page_source = classify_page_full(
+                    None, jp, settings, pagetype_model_id,
+                    precomputed=pre["pagetype"])
+            else:
+                # Not run remotely (e.g. a detector): classify here.
+                image = cv2.imread(str(jp))
+                if image is None:
+                    raise ValueError("Could not read image")
+                page_type, page_conf, page_source = classify_page_full(
+                    image, jp, settings, pagetype_model_id)
         else:
             image = cv2.imread(str(jp))
             if image is None:
@@ -521,13 +572,13 @@ def _process_one(batch_id: int, root: Path, filepath: Path, settings: dict,
             jpeg_path=str(jp),
             bad_scan=bad_scan, bad_scan_conf=bad_scan_conf,
             page_type=page_type, page_type_conf=page_conf,
-            page_type_source=page_source,
+            page_type_source=page_source, **ident,
         )
         return scan_id, jp, page_type
     except Exception as e:
         db.add_scan(
             batch_id, directory, filepath.name, str(filepath),
-            status="error", error=str(e),
+            status="error", error=str(e), **ident,
         )
         return None
 

@@ -1,0 +1,70 @@
+{% extends "base.html" %}
+{% block title %}Records — Yale Scanning QC{% endblock %}
+
+{% block content %}
+<div id="recordsRoot">
+
+  <div class="pagehead">
+    <div>
+      <h1>Records</h1>
+      <p class="sub">One row per scan: what the model said, what the annotator said, and what became
+        of the image. Includes files that have since left the folder. Filter on any column,
+        then export exactly what you see as CSV.</p>
+    </div>
+    <div class="headactions">
+      <details class="colpick" id="colPick">
+        <summary class="btn" id="colSummary">Columns</summary>
+        <div class="colpanel" id="colPanel"></div>
+      </details>
+      <button class="btn" id="rawBtn" aria-expanded="false">Show raw CSV</button>
+      <a class="btn primary" id="exportBtn" href="#" download>Export CSV</a>
+    </div>
+  </div>
+
+  <section class="panel rec-toolbar">
+    <div class="presets" id="presets" role="group" aria-label="Quick views"></div>
+
+    <div class="rec-filterbar">
+      <label class="field rec-search"><span>Search all text</span>
+        <input class="input" id="rSearch" type="search"
+               placeholder="filename, folder, notes, transcription…"></label>
+      <label class="field"><span>Filter on</span>
+        <select id="rField"></select></label>
+      <div class="rec-op" id="rOp"></div>
+      <button class="btn sm" id="rAdd">Add filter</button>
+    </div>
+
+    <div class="chips" id="rChips" aria-live="polite"></div>
+  </section>
+
+  <div class="rec-summary">
+    <span id="rSummary">Loading…</span>
+    <span class="grow"></span>
+    <label class="field inline"><span>Per page</span>
+      <select id="rPer"><option>50</option><option>100</option><option>250</option><option>500</option></select></label>
+  </div>
+
+  <div class="rec-wrap" id="recWrap">
+    <table class="records" id="recTable"></table>
+    <p class="empty" id="rEmpty" hidden>No rows match these filters.</p>
+  </div>
+
+  <div class="pager">
+    <button class="btn sm" id="rPrev">← Previous</button>
+    <span id="rPage">page 1</span>
+    <button class="btn sm" id="rNext">Next →</button>
+  </div>
+
+  <section class="panel rawcsv" id="rawPanel" hidden>
+    <div class="rawhead">
+      <strong>Raw CSV</strong>
+      <span class="hint" id="rawHint">first rows of the file the export would download</span>
+    </div>
+    <pre id="rawCsv"></pre>
+  </section>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script src="{{ url_for('static', filename='js/records.js') }}"></script>
+{% endblock %}

@@ -54,6 +54,12 @@ def settings_page():
     )
 
 
+@bp.get("/records")
+def records_page():
+    """The scan table: filter on any column, see it as CSV, export it."""
+    return render_template("records.html", active_nav="records")
+
+
 @bp.get("/data")
 def data_browser():
     """The training-data browser: inspect and correct every labeled image."""

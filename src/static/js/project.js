@@ -15,6 +15,8 @@
     selected: new Set(),
     openIdx: -1,
     polling: null,
+    similar: null,      // {id, filename} while ranking by likeness to one scan
+    minScore: 0,
     view: localStorage.getItem('qc-project-view') || 'grid',
   };
 
@@ -23,10 +25,17 @@
   function query() {
     const p = new URLSearchParams({ page: String(state.page), per_page: String(state.perPage) });
     if ($('fFlagged').value) p.set('flagged', $('fFlagged').value);
-    if ($('fReviewed').value) p.set('reviewed', $('fReviewed').value);
+    if ($('fReviewed').value === 'kept') p.set('kept', '1');
+    else if ($('fReviewed').value) p.set('reviewed', $('fReviewed').value);
+    // Always sent: the server's default is "on disk", and '' means all.
+    p.set('present', $('fPresent').value);
     if ($('fPageType').value) p.set('page_type', $('fPageType').value);
     if ($('fTranscribed').value) p.set('transcribed', $('fTranscribed').value);
     if (TREE && $('fDir').value) p.set('dir', $('fDir').value);
+    if (state.similar) {
+      p.set('similar_to', String(state.similar.id));
+      if (state.minScore) p.set('min_score', String(state.minScore));
+    }
     return p.toString();
   }
 
@@ -35,6 +44,7 @@
       const d = await get(`/api/projects/${PID}/scans?${query()}`);
       state.rows = d.scans || [];
       renderCounts(d.counts || {});
+      renderSimbar(d.similarity);
       render();
       $('pageInfo').textContent = `page ${state.page} · ${state.rows.length} shown`;
       $('prevPage').disabled = state.page <= 1;
@@ -51,10 +61,56 @@
       `<span class="chip good">clean <b>${c.clean || 0}</b></span>`,
       c.unknown ? `<span class="chip warn">unscored <b>${c.unknown}</b></span>` : '',
       `<span class="chip">reviewed <b>${c.reviewed || 0}</b></span>`,
+      `<span class="chip kept" title="Scans kept as training data (the model got them wrong)">kept <b>${c.kept || 0}</b></span>`,
+      c.gone ? `<span class="chip warn" title="Seen on an earlier pass, no longer in the folder">gone <b>${c.gone}</b></span>` : '',
       c.errors ? `<span class="chip warn">errors <b>${c.errors}</b></span>` : '',
       c.transcribed ? `<span class="chip">transcribed <b>${c.transcribed}</b></span>` : '',
     ].filter(Boolean).join('');
   }
+
+  /* ---------------- similar-image mode ---------------- */
+
+  function renderSimbar(st) {
+    $('simbar').hidden = !state.similar;
+    if (!state.similar) return;
+    $('simName').textContent = state.similar.filename;
+    $('simThumb').src = `/api/projects/scans/${state.similar.id}/image`;
+    let msg = `${state.rows.length} shown, best match first`;
+    if (st && st.running) {
+      msg += ` · indexing ${st.done}/${st.todo} new images — results fill in as it runs`;
+    }
+    $('simStatus').textContent = msg;
+  }
+
+  function findSimilar(r) {
+    if (!r) return;
+    state.similar = { id: r.id, filename: r.relpath || r.filename };
+    state.page = 1;
+    closeDrawer();
+    window.scrollTo({ top: 0 });
+    load();
+  }
+
+  function exitSimilar() {
+    state.similar = null;
+    state.page = 1;
+    load();
+  }
+
+  $('simExit').addEventListener('click', exitSimilar);
+  $('simSelect').addEventListener('click', () => {
+    state.rows.forEach((r) => state.selected.add(r.id));
+    render();
+  });
+  $('simMin').addEventListener('input', (ev) => {
+    const v = Number(ev.target.value);
+    $('simMinVal').textContent = v ? `${v}%` : 'any';
+  });
+  $('simMin').addEventListener('change', (ev) => {
+    state.minScore = Number(ev.target.value) / 100;
+    state.page = 1;
+    load();
+  });
 
   /* A review is stored as TP/FP/FN/TN; show it as what the human decided. */
   function reviewLabel(v) {
@@ -63,8 +119,9 @@
     return '';
   }
 
+  /* A gone file only has a preview if a copy was kept (has_jpeg covers that). */
   function hasPreview(r) {
-    return r.has_jpeg || /\.(jpe?g|png)$/i.test(r.filepath);
+    return r.has_jpeg || (r.present !== 0 && /\.(jpe?g|png)$/i.test(r.filepath));
   }
 
   function badgesFor(r) {
@@ -72,8 +129,29 @@
       ? `<span class="tag ${esc(r.bad_scan)}">${esc(pretty(r.bad_scan))}` +
         `${r.bad_scan_conf ? ` ${(r.bad_scan_conf * 100).toFixed(0)}%` : ''}</span>`
       : '<span class="tag">unscored</span>';
-    return verdict +
-      (r.page_type ? `<span class="tag src">${esc(pretty(r.page_type))}</span>` : '');
+    const sim = r.similarity != null
+      ? `<span class="tag sim" title="Visual similarity">${(r.similarity * 100).toFixed(0)}%</span>` : '';
+    const kept = r.kept
+      ? '<span class="tag kept" title="Kept as training data — the model got this one wrong">kept</span>' : '';
+    const gone = r.present === 0
+      ? '<span class="tag gone" title="No longer in the folder">gone</span>' : '';
+    return sim + verdict + pageTypeBadge(r) + kept + gone;
+  }
+
+  const isQuery = (r) => state.similar && state.similar.id === r.id;
+
+  /* A reviewer's page type is a label; a model/LLM page type is only a
+     guess until someone confirms it, so it is shown as one. */
+  function pageTypeBadge(r) {
+    if (r.review_page_type) {
+      return `<span class="tag rev" title="Your page type">${esc(pretty(r.review_page_type))}</span>`;
+    }
+    if (!r.page_type) return '';
+    const src = (r.page_type_source || '').startsWith('llm') ? 'LLM' : 'model';
+    const conf = r.page_type_conf != null && src === 'model'
+      ? ` ${(r.page_type_conf * 100).toFixed(0)}%` : '';
+    return `<span class="tag guess" title="${src} guess — not reviewed">` +
+      `${esc(pretty(r.page_type))}?${conf}</span>`;
   }
 
   function render() {
@@ -93,10 +171,12 @@
         : '<div class="missing">no preview</div>';
       const rev = reviewLabel(r.review_verdict);
       return `
-        <div class="tile ${state.selected.has(r.id) ? 'sel' : ''}" data-idx="${i}" data-id="${r.id}">
+        <div class="tile ${state.selected.has(r.id) ? 'sel' : ''} ${isQuery(r) ? 'query' : ''}"
+             data-idx="${i}" data-id="${r.id}">
           <input type="checkbox" class="cb" ${state.selected.has(r.id) ? 'checked' : ''}
                  aria-label="Select ${esc(r.filename)}">
           ${rev ? `<span class="flag">${esc(rev)}</span>` : ''}
+          <button class="simbtn" title="Show images that look like this one">≈ Similar</button>
           ${img}
           <div class="tmeta">
             <div class="badges">${badgesFor(r)}</div>
@@ -119,7 +199,8 @@
         ? `<pre class="ttext">${esc(r.transcription)}</pre>`
         : '<p class="hint">No transcription for this page.</p>';
       return `
-        <div class="trow ${state.selected.has(r.id) ? 'sel' : ''}" data-idx="${i}" data-id="${r.id}">
+        <div class="trow ${state.selected.has(r.id) ? 'sel' : ''} ${isQuery(r) ? 'query' : ''}"
+             data-idx="${i}" data-id="${r.id}">
           <div class="timg">
             <input type="checkbox" class="cb" ${state.selected.has(r.id) ? 'checked' : ''}
                    aria-label="Select ${esc(r.filename)}">
@@ -270,7 +351,8 @@
     $('dFilename').textContent = r.filename;
     $('dFilename').title = r.filepath;
     const img = $('dImg');
-    if (r.has_jpeg || /\.(jpe?g|png)$/i.test(r.filepath)) {
+    $('vImgWrap').classList.remove('actual');
+    if (hasPreview(r)) {
       img.src = `/api/projects/scans/${r.id}/image?full=1`;
       img.style.display = '';
     } else {
@@ -281,8 +363,13 @@
     const rows = [
       ['Model says', r.bad_scan ? `${pretty(r.bad_scan)}` +
         (r.bad_scan_conf ? ` (${(r.bad_scan_conf * 100).toFixed(1)}%)` : '') : 'not scored'],
-      ['Page type', r.page_type ? `${pretty(r.page_type)}${r.page_type_source ? ` · ${r.page_type_source}` : ''}` : '—'],
-      ['Your review', reviewLabel(r.review_verdict) || 'not reviewed'],
+      ['Model page type', r.page_type ? `${pretty(r.page_type)}${r.page_type_source ? ` · ${r.page_type_source}` : ''}` : '—'],
+      ['Your review', (reviewLabel(r.review_verdict) || 'not reviewed') +
+        (r.reviewer ? ` · ${r.reviewer}` : '') +
+        (r.reviewed_at ? ` · ${r.reviewed_at.slice(0, 16).replace('T', ' ')}` : '')],
+      ['Your page type', r.review_page_type ? pretty(r.review_page_type) : '—'],
+      ['Kept', r.kept ? 'yes — copy and metadata are in the training data' : 'no'],
+      ['File', r.present === 0 ? 'gone from the folder' : 'on disk'],
       ['Pass', `${r.batch_label || '—'} · ${(r.batch_started || '').slice(0, 10)}`],
       ['Status', r.status + (r.error ? ` — ${r.error}` : '')],
       ['Path', r.filepath],
@@ -312,18 +399,107 @@
       }).catch(() => {});
     }
 
-    // Show which bookkeeping verdict the answer will record.
+    // Show which bookkeeping verdict the answer will record, and what
+    // happened to the image as a result.
     const flagged = r.bad_scan === 'bad_scan';
-    $('verdictHint').textContent = flagged
-      ? 'The model flagged this one.'
-      : 'The model did not flag this one.';
     const cur = reviewLabel(r.review_verdict);
+    let hint = flagged ? 'The model flagged this one.' : 'The model did not flag this one.';
+    if (cur) {
+      const wrong = r.review_verdict === 'false_positive' || r.review_verdict === 'false_negative';
+      hint += wrong
+        ? ' You overruled it — a copy is kept as training data.'
+        : ' You agreed — nothing kept.';
+    }
+    $('verdictHint').textContent = hint;
     $('vBad').classList.toggle('on', cur === 'bad');
     $('vGood').classList.toggle('on', cur === 'fine');
 
     $('dPageType').value = r.review_page_type || '';
     $('dNotes').value = r.review_notes || '';
+    loadTrainLabels(r);
+    loadHistory(r);
     $('drawer').hidden = false;
+  }
+
+  /* Everything an annotator has done to this scan, newest first. */
+  async function loadHistory(r) {
+    const box = $('dHistory');
+    box.innerHTML = '';
+    let rows;
+    try {
+      rows = (await get(`/api/projects/scans/${r.id}/history`)).history || [];
+    } catch { return; }
+    if (state.rows[state.openIdx] !== r) return;
+    box.innerHTML = '<div class="lhead">History</div>' +
+      (rows.length ? rows.map(historyRow).join('') : '<p class="hint">No annotations yet.</p>');
+  }
+
+  function historyRow(h) {
+    const when = (h.created_at || '').slice(0, 16).replace('T', ' ');
+    let what;
+    if (h.action === 'verdict') {
+      what = `answered <b>${esc(reviewLabel(h.new_value) || h.new_value)}</b>` +
+        ` <span class="hint">(${esc(pretty(h.new_value))})</span>`;
+    } else if (h.action === 'page_type') {
+      what = `page type <b>${esc(pretty(h.new_value) || '—')}</b>` +
+        (h.old_value ? ` <span class="hint">was ${esc(pretty(h.old_value))}</span>` : '');
+    } else if (h.action === 'relabel') {
+      what = `training label <b>${esc(pretty(h.new_value))}</b>` +
+        ` <span class="hint">was ${esc(pretty(h.old_value))}</span>`;
+    } else if (h.action === 'notes') {
+      what = 'edited notes';
+    } else {
+      what = esc(h.action);
+    }
+    return `<div class="hrow">
+      <span class="hwhen">${esc(when)}</span>
+      <span class="hwho">${esc(h.reviewer || '—')}</span>
+      <span class="hwhat">${what}${h.notes ? `<div class="hnote">“${esc(h.notes)}”</div>` : ''}</span>
+    </div>`;
+  }
+
+  /* The training-data rows built from this scan: what each model will learn
+     from it now, and what it was first imported as. */
+  async function loadTrainLabels(r) {
+    const box = $('dTrainLabels');
+    box.innerHTML = '';
+    let rows;
+    try {
+      rows = (await get(`/api/projects/scans/${r.id}/labels`)).examples || [];
+    } catch { return; }
+    if (state.rows[state.openIdx] !== r) return;
+    if (!rows.length) {
+      box.innerHTML = '<div class="lhead">Training labels</div>' +
+        '<p class="hint">Not in the training data yet.</p>';
+      return;
+    }
+    box.innerHTML = '<div class="lhead">Training labels</div>' + rows.map((e) => {
+      const changed = e.original_label && e.original_label !== e.label;
+      return `<div class="lrow">
+        <span class="lrole">${esc(e.role === 'badscan' ? 'Bad scan' : 'Page type')}</span>
+        <span class="tag ${esc(e.label)}">${esc(pretty(e.label))}</span>
+        ${changed ? `<span class="hint">was ${esc(pretty(e.original_label))}</span>` : ''}
+        <span class="tag src">${esc(e.source)}</span>
+        ${e.active ? '' : '<span class="tag">excluded</span>'}
+      </div>`;
+    }).join('');
+  }
+
+  async function savePageType() {
+    if (state.openIdx < 0) return;
+    const r = state.rows[state.openIdx];
+    const pt = $('dPageType').value || null;
+    // Give focus back to the page so ←/→ move between scans, not options.
+    $('dPageType').blur();
+    try {
+      await post(`/api/projects/scans/${r.id}/page-type`, { page_type: pt });
+      r.review_page_type = pt;
+      toast(pt ? `Page type set to ${pretty(pt)}` : 'Page type cleared');
+      render();
+      if (state.rows[state.openIdx] === r) openDrawer(state.openIdx);
+    } catch (e) {
+      toast(e.message, true);
+    }
   }
 
   const closeDrawer = () => { $('drawer').hidden = true; state.openIdx = -1; };
@@ -346,9 +522,13 @@
         review_page_type: $('dPageType').value || null,
         review_notes: $('dNotes').value,
         filename: r.filename,
-        has_jpeg: r.has_jpeg,
+        has_jpeg: r.has_jpeg || !!d.kept,
+        kept: !!d.kept,
       });
-      toast(`Recorded: ${isBad ? 'bad scan' : 'looks fine'} (${d.verdict.replace(/_/g, ' ')})`);
+      const outcome = d.disagreement
+        ? 'model was wrong — kept for training'
+        : 'model agreed — not kept';
+      toast(`Recorded: ${isBad ? 'bad scan' : 'looks fine'} · ${outcome}`);
       render();
       // Move straight on — reviewing is a queue.
       if (state.openIdx < state.rows.length - 1) openDrawer(state.openIdx + 1);
@@ -429,18 +609,38 @@
     if (!ids.length) { toast('Select some scans first', true); return; }
     const what = isBad ? 'bad scans' : 'fine';
     if (!confirm(`Mark ${ids.length} selected scan(s) as ${what}?\n\n`
-      + 'Each becomes a review and immediate training data.')) return;
+      + 'Each becomes a review; the ones the model got wrong are kept as training data.')) return;
     try {
       const d = await post(`/api/projects/${PID}/bulk-verdict`, {
         scan_ids: ids,
         is_bad: isBad,
-        page_type: $('bulkPageType').value || null,
+        notes: $('bulkNotes').value.trim(),
       });
-      toast(`Reviewed ${d.reviewed} scan(s) as ${what}`);
+      toast(`Reviewed ${d.reviewed} scan(s) as ${what} · ${d.kept || 0} kept for training`);
       state.selected.clear();
+      $('bulkNotes').value = '';
       load();
     } catch (e) { toast(e.message, true); }
   }
+  /* Bulk page type: applies as soon as one is picked. */
+  $('bulkPageType').addEventListener('change', async (ev) => {
+    const pt = ev.target.value;
+    const ids = [...state.selected];
+    ev.target.blur();
+    if (!pt || !ids.length) return;
+    if (!confirm(`Set ${ids.length} selected scan(s) to "${pretty(pt)}"?`)) {
+      ev.target.value = '';
+      return;
+    }
+    try {
+      const d = await post(`/api/projects/${PID}/bulk-page-type`, { scan_ids: ids, page_type: pt });
+      toast(`Set ${d.updated} scan(s) to ${pretty(pt)}`);
+      state.selected.clear();
+      ev.target.value = '';
+      load();
+    } catch (e) { toast(e.message, true); }
+  });
+
   $('bulkBad').addEventListener('click', () => bulkVerdict(true));
   $('bulkGood').addEventListener('click', () => bulkVerdict(false));
 
@@ -490,6 +690,10 @@
     const tile = ev.target.closest('.tile, .trow');
     if (!tile) return;
     const id = Number(tile.dataset.id);
+    if (ev.target.classList.contains('simbtn')) {
+      findSimilar(state.rows[Number(tile.dataset.idx)]);
+      return;
+    }
     if (ev.target.classList.contains('cb')) {
       if (state.selected.has(id)) state.selected.delete(id);
       else state.selected.add(id);
@@ -505,6 +709,9 @@
   $('vBad').addEventListener('click', () => submitVerdict(true));
   $('vGood').addEventListener('click', () => submitVerdict(false));
   $('dClose').addEventListener('click', closeDrawer);
+  $('dPageType').addEventListener('change', savePageType);
+  $('dSimilar').addEventListener('click', () => findSimilar(state.rows[state.openIdx]));
+  $('vImgWrap').addEventListener('click', () => $('vImgWrap').classList.toggle('actual'));
   $('dPrev').addEventListener('click', () => openDrawer(Math.max(0, state.openIdx - 1)));
   $('dNext').addEventListener('click', () =>
     openDrawer(Math.min(state.rows.length - 1, state.openIdx + 1)));
@@ -515,7 +722,7 @@
   });
   $('selNone').addEventListener('click', () => { state.selected.clear(); render(); });
 
-  ['fFlagged', 'fReviewed', 'fPageType', 'fTranscribed', 'fDir'].forEach((id) =>
+  ['fFlagged', 'fReviewed', 'fPageType', 'fTranscribed', 'fDir', 'fPresent'].forEach((id) =>
     $(id).addEventListener('change', () => { state.page = 1; load(); }));
   $('fView').value = state.view;
   $('fView').addEventListener('change', (ev) => {
@@ -535,12 +742,22 @@
 
   document.addEventListener('keydown', (ev) => {
     if (ev.target.matches('input, textarea, select')) return;
-    if (ev.key === 'Escape') { closeDrawer(); return; }
+    if (ev.key === 'Escape') {
+      if (state.openIdx >= 0) closeDrawer();
+      else if (state.similar) exitSimilar();
+      return;
+    }
     if (state.openIdx < 0) return;
-    if (ev.key === 'b') submitVerdict(true);
+    if (ev.key === 's') findSimilar(state.rows[state.openIdx]);
+    else if (ev.key === 'b') submitVerdict(true);
     else if (ev.key === 'g') submitVerdict(false);
-    else if (ev.key === 'j') openDrawer(Math.min(state.rows.length - 1, state.openIdx + 1));
-    else if (ev.key === 'k') openDrawer(Math.max(0, state.openIdx - 1));
+    else if (ev.key === 'ArrowRight' || ev.key === 'j') {
+      ev.preventDefault();
+      openDrawer(Math.min(state.rows.length - 1, state.openIdx + 1));
+    } else if (ev.key === 'ArrowLeft' || ev.key === 'k') {
+      ev.preventDefault();
+      openDrawer(Math.max(0, state.openIdx - 1));
+    }
   });
 
   /* page-type pickers */

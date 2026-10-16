@@ -114,6 +114,16 @@ def init_app() -> None:
         db.init_db()
         registry.seed_registry()
         scheduler.start()
+        # Embed any images not yet in the similarity index (background).
+        from . import similarity
+
+        similarity.index_missing_async(delay=5)
+        # Copy any reviewer-labeled images that still point into a watched
+        # folder into the app's own store (idempotent; cheap once done).
+        from . import examples as _examples
+
+        threading.Thread(target=_examples.sync_all, daemon=True,
+                         name="examples-sync").start()
         _initialized = True
         print("Yale Scanning QC (batch mode) initialized.")
 
@@ -135,9 +145,9 @@ def login():
             session.clear()
             session["user"] = username
             session.permanent = True
-            nxt = request.args.get("next") or request.form.get("next") or url_for("index")
+            nxt = request.args.get("next") or request.form.get("next") or url_for("views.home")
             if not nxt.startswith("/"):
-                nxt = url_for("index")
+                nxt = url_for("views.home")
             return redirect(nxt)
         error = "Invalid username or password."
 
@@ -468,20 +478,19 @@ def api_review_scan(scan_id: int):
     if page_type is not None and page_type not in all_page_types(db.get_settings()):
         return jsonify({"error": f"Invalid page type: {page_type}"}), 400
 
-    db.save_review(
-        scan_id, verdict,
-        page_type=page_type,
-        notes=(data.get("notes") or "").strip(),
-        reviewer=session.get("user", ""),
-    )
-    # Fold the verdict into the training-example store straight away so it
-    # is visible (and correctable) in the data browser without waiting for
-    # the next dataset build.
+    reviewer = session.get("user", "")
+    notes = (data.get("notes") or "").strip()
+    db.save_review(scan_id, verdict, page_type=page_type, notes=notes, reviewer=reviewer)
+    db.log_annotation("verdict", role="badscan", scan_id=scan_id,
+                      filepath=scan["filepath"],
+                      old_value=scan.get("review_verdict") or "", new_value=verdict,
+                      notes=notes, reviewer=reviewer)
+    # Keep the scan (copy + metadata) straight away when the model got it
+    # wrong, so it is visible and correctable in the data browser.
     from . import examples as _examples
-    _examples.sync("badscan")
-    if page_type:
-        _examples.sync("pagetype")
-    return jsonify({"scan": db.get_scan(scan_id)})
+    _examples.sync_scan(scan_id, ("badscan", "pagetype") if page_type else ("badscan",))
+    return jsonify({"scan": db.get_scan(scan_id),
+                    "kept": db.scan_kept_copy(scan_id) is not None})
 
 
 # ---------------------------------------------------------------------------

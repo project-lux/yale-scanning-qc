@@ -66,6 +66,11 @@ CREATE TABLE IF NOT EXISTS training_examples (
     -- which the dataset builder always keeps rather than sampling out.
     verdict        TEXT NOT NULL DEFAULT '',
     notes          TEXT NOT NULL DEFAULT '',
+    -- Everything known about the scan when it was kept (JSON): where it
+    -- came from, what the model said and with which version, who reviewed
+    -- it and when. The staging folder it came from will not be there
+    -- later, so this is the record.
+    meta           TEXT NOT NULL DEFAULT '{}',
     active         INTEGER NOT NULL DEFAULT 1,
     created_at     TEXT NOT NULL,
     updated_at     TEXT NOT NULL,
@@ -74,6 +79,28 @@ CREATE TABLE IF NOT EXISTS training_examples (
 CREATE INDEX IF NOT EXISTS idx_texamples_role   ON training_examples(role, active);
 CREATE INDEX IF NOT EXISTS idx_texamples_label  ON training_examples(role, label);
 CREATE INDEX IF NOT EXISTS idx_texamples_proj   ON training_examples(project_id);
+CREATE INDEX IF NOT EXISTS idx_texamples_scan   ON training_examples(scan_id);
+
+-- Every annotator action, kept forever: the verdicts and notes made while
+-- reviewing, and the corrections made later on the training-data page.
+-- scan_id/example_id are plain integers, not foreign keys, because the
+-- history must outlive the rows it describes.
+CREATE TABLE IF NOT EXISTS annotations (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at TEXT NOT NULL,
+    reviewer   TEXT NOT NULL DEFAULT '',
+    action     TEXT NOT NULL,              -- verdict | page_type | relabel | exclude | restore | notes | delete
+    role       TEXT NOT NULL DEFAULT '',   -- badscan | pagetype | ''
+    scan_id    INTEGER,
+    example_id INTEGER,
+    filepath   TEXT NOT NULL DEFAULT '',   -- original path of the scan
+    old_value  TEXT NOT NULL DEFAULT '',
+    new_value  TEXT NOT NULL DEFAULT '',
+    notes      TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_annotations_scan    ON annotations(scan_id);
+CREATE INDEX IF NOT EXISTS idx_annotations_example ON annotations(example_id);
+CREATE INDEX IF NOT EXISTS idx_annotations_path    ON annotations(filepath);
 
 CREATE TABLE IF NOT EXISTS directories (
     id       INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -133,7 +160,15 @@ CREATE TABLE IF NOT EXISTS scans (
     transcription_lines TEXT,          -- JSON {w, h, lines:[{text, polygon, …}]}
     status         TEXT NOT NULL DEFAULT 'ok',  -- ok | error
     error          TEXT NOT NULL DEFAULT '',
-    processed_at   TEXT NOT NULL
+    processed_at   TEXT NOT NULL,
+    -- Size and mtime of the file when it was processed. A re-capture lands
+    -- at the same path with a different size/mtime, so this is how a pass
+    -- tells "already seen" from "replaced since".
+    file_size      INTEGER NOT NULL DEFAULT 0,
+    file_mtime     REAL NOT NULL DEFAULT 0,
+    -- Still in the watched folder as of the last pass. Approved captures
+    -- leave for their permanent home; this is how the grid knows.
+    present        INTEGER NOT NULL DEFAULT 1
 );
 CREATE INDEX IF NOT EXISTS idx_scans_batch ON scans(batch_id);
 CREATE INDEX IF NOT EXISTS idx_scans_path  ON scans(filepath);
@@ -151,6 +186,15 @@ CREATE TABLE IF NOT EXISTS transcriptions (
     UNIQUE(scan_id, backend)
 );
 CREATE INDEX IF NOT EXISTS idx_transcriptions_scan ON transcriptions(scan_id);
+
+-- One visual embedding per image file, for "find similar" (src/similarity.py).
+-- Keyed by path so scans and training examples of the same image share it.
+CREATE TABLE IF NOT EXISTS image_embeddings (
+    path       TEXT PRIMARY KEY,
+    model      TEXT NOT NULL,
+    vec        BLOB NOT NULL,              -- float16, L2-normalised
+    created_at TEXT NOT NULL
+);
 
 CREATE TABLE IF NOT EXISTS reviews (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -258,6 +302,17 @@ def init_db() -> None:
             db.execute("ALTER TABLE projects ADD COLUMN mode TEXT NOT NULL DEFAULT 'flat'")
         except sqlite3.OperationalError:
             pass
+        # Kept-scan metadata, file identity and presence (staging-folder workflow).
+        for stmt in (
+            "ALTER TABLE training_examples ADD COLUMN meta TEXT NOT NULL DEFAULT '{}'",
+            "ALTER TABLE scans ADD COLUMN file_size INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE scans ADD COLUMN file_mtime REAL NOT NULL DEFAULT 0",
+            "ALTER TABLE scans ADD COLUMN present INTEGER NOT NULL DEFAULT 1",
+        ):
+            try:
+                db.execute(stmt)
+            except sqlite3.OperationalError:
+                pass
 
         # --- mistake -> bad_scan rename migration ---
         scan_cols = _columns(db, "scans")
@@ -513,6 +568,9 @@ def delete_batch(batch_id: int) -> dict:
             "SELECT COUNT(*) AS n FROM scans WHERE batch_id=?", (batch_id,)).fetchone()["n"]
         db.execute("DELETE FROM reviews WHERE scan_id IN "
                    "(SELECT id FROM scans WHERE batch_id=?)", (batch_id,))
+        # Kept training examples outlive the scan rows they came from.
+        db.execute("UPDATE training_examples SET scan_id=NULL WHERE scan_id IN "
+                   "(SELECT id FROM scans WHERE batch_id=?)", (batch_id,))
         db.execute("DELETE FROM scans WHERE batch_id=?", (batch_id,))
         db.execute("DELETE FROM batches WHERE id=?", (batch_id,))
         return {"scans": n_scans, "reviews": n_reviews}
@@ -556,17 +614,19 @@ def add_scan(batch_id: int, directory: str, filename: str, filepath: str,
              page_type_source: str = "",
              transcription: str | None = None, transcription_backend: str = "",
              transcription_lines: str | None = None,
-             status: str = "ok", error: str = "") -> int:
+             status: str = "ok", error: str = "",
+             file_size: int = 0, file_mtime: float = 0.0) -> int:
     with _write_lock, get_db() as db:
         cur = db.execute(
             "INSERT INTO scans (batch_id, directory, filename, filepath, jpeg_path, "
             "bad_scan, bad_scan_conf, page_type, page_type_conf, page_type_source, "
             "transcription, transcription_backend, transcription_lines, "
-            "status, error, processed_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "status, error, processed_at, file_size, file_mtime, present) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)",
             (batch_id, directory, filename, filepath, jpeg_path, bad_scan, bad_scan_conf,
              page_type, page_type_conf, page_type_source, transcription,
-             transcription_backend, transcription_lines, status, error, utcnow()),
+             transcription_backend, transcription_lines, status, error, utcnow(),
+             int(file_size or 0), float(file_mtime or 0.0)),
         )
         return cur.lastrowid
 
@@ -609,6 +669,16 @@ def update_scan(scan_id: int, **fields) -> None:
                    (*cols.values(), scan_id))
 
 
+def set_scan_present(scan_id: int, present: bool) -> None:
+    """
+    Record whether a scan's file is still in the watched folder, without
+    touching its status or processed_at: a file that left the staging
+    folder is expected, not an error.
+    """
+    with _write_lock, get_db() as db:
+        db.execute("UPDATE scans SET present=? WHERE id=?", (1 if present else 0, scan_id))
+
+
 def refresh_batch_stats(batch_id: int) -> None:
     """Recompute a batch's aggregate counts after in-place scan updates."""
     with _write_lock, get_db() as db:
@@ -626,6 +696,61 @@ def already_scanned_paths() -> set[str]:
     """Absolute file paths that have been processed in any previous batch."""
     with get_db() as db:
         return {r["filepath"] for r in db.execute("SELECT DISTINCT filepath FROM scans")}
+
+
+def scanned_file_versions() -> dict[str, tuple[int, float]]:
+    """
+    Latest recorded (size, mtime) per processed path. A file whose current
+    size/mtime differ from this was re-captured since it was last seen and
+    is due for a fresh pass; one that matches is already done.
+    """
+    with get_db() as db:
+        rows = db.execute(
+            "SELECT s.filepath, s.file_size, s.file_mtime FROM scans s "
+            "JOIN (SELECT filepath, MAX(id) AS mid FROM scans GROUP BY filepath) t "
+            "  ON s.id = t.mid").fetchall()
+    return {r["filepath"]: (r["file_size"] or 0, r["file_mtime"] or 0.0) for r in rows}
+
+
+def file_changed(path, recorded: tuple[int, float] | None) -> bool:
+    """
+    True when *path* is unseen, or its size/mtime no longer match the
+    recorded pair. Rows from before file identity was recorded (0, 0) are
+    treated as unchanged so an upgrade does not re-process everything.
+    """
+    if recorded is None:
+        return True
+    size, mtime = recorded
+    if not size and not mtime:
+        return False
+    try:
+        st = path.stat()
+    except OSError:
+        return False
+    return st.st_size != size or abs(st.st_mtime - mtime) > 1.0
+
+
+def mark_presence(root: str, present_paths: set[str]) -> dict:
+    """
+    Record which of a directory tree's scans are still on disk. Called
+    after each walk of *root*: the latest scan of every file under it is
+    marked present if the walk saw the path, gone otherwise. Re-computed on
+    every pass, so a file that comes back is simply present again.
+    """
+    with _write_lock, get_db() as db:
+        db.execute("CREATE TEMP TABLE IF NOT EXISTS _seen (path TEXT PRIMARY KEY)")
+        db.execute("DELETE FROM _seen")
+        db.executemany("INSERT OR IGNORE INTO _seen (path) VALUES (?)",
+                       [(p,) for p in present_paths])
+        gone = db.execute(
+            "UPDATE scans SET present=0 WHERE present=1 "
+            "AND (directory = ? OR directory LIKE ? || '/%') "
+            "AND filepath NOT IN (SELECT path FROM _seen)", (root, root)).rowcount
+        back = db.execute(
+            "UPDATE scans SET present=1 WHERE present=0 "
+            "AND filepath IN (SELECT path FROM _seen)").rowcount
+        db.execute("DELETE FROM _seen")
+    return {"gone": gone, "returned": back}
 
 
 def scans_for_path(filepath: str) -> list[dict]:
@@ -714,85 +839,187 @@ def save_review(scan_id: int, verdict: str, page_type: str | None = None,
             "INSERT INTO reviews (scan_id, verdict, page_type, notes, reviewer, created_at) "
             "VALUES (?, ?, ?, ?, ?, ?) "
             "ON CONFLICT(scan_id) DO UPDATE SET verdict=excluded.verdict, "
-            "page_type=excluded.page_type, notes=excluded.notes, "
+            # No page type given means "unchanged", not "clear it".
+            "page_type=COALESCE(excluded.page_type, reviews.page_type), "
+            "notes=excluded.notes, "
             "reviewer=excluded.reviewer, created_at=excluded.created_at",
             (scan_id, verdict, page_type, notes, reviewer, utcnow()),
         )
 
 
-def labeled_badscan_examples() -> list[dict]:
+def save_review_page_type(scan_id: int, page_type: str | None,
+                          reviewer: str = "") -> None:
     """
-    Human-verified binary labels derived from reviews — ALL reviewed
-    scans are included, which is the whole point: every flag, missed
-    flag, and correction is training signal.
+    Record just the reviewer's page type, leaving any bad-scan answer alone.
 
-    The latest review per file path wins, so re-passes after retraining
-    refresh labels rather than duplicating them.
-      bad_scan:    true_positive (model right) + false_negative (model missed)
-      no_bad_scan: false_positive (model wrong) + true_negative (confirmed clean)
+    A scan with no review yet gets one with an empty verdict, which the
+    bad-scan label export skips — choosing a page type is not an answer to
+    "is this a bad scan?".
+    """
+    with _write_lock, get_db() as db:
+        db.execute(
+            "INSERT INTO reviews (scan_id, verdict, page_type, reviewer, created_at) "
+            "VALUES (?, '', ?, ?, ?) "
+            "ON CONFLICT(scan_id) DO UPDATE SET page_type=excluded.page_type, "
+            "reviewer=excluded.reviewer, created_at=excluded.created_at",
+            (scan_id, page_type, reviewer, utcnow()),
+        )
+
+
+_REVIEW_SCAN_SQL = (
+    "SELECT r.id AS review_id, r.scan_id, r.verdict, r.page_type AS review_page_type, "
+    " r.notes AS review_notes, r.reviewer, r.created_at AS reviewed_at, "
+    " s.filepath, s.jpeg_path, s.directory, s.filename, s.bad_scan, s.bad_scan_conf, "
+    " s.page_type, s.page_type_conf, s.page_type_source, s.batch_id, s.file_size, "
+    " s.file_mtime, s.present, "
+    " b.label AS batch_label, b.started_at AS batch_started, "
+    " m1.version AS badscan_model_version, m2.version AS pagetype_model_version "
+    "FROM reviews r JOIN scans s ON s.id = r.scan_id "
+    "JOIN batches b ON b.id = s.batch_id "
+    "LEFT JOIN models m1 ON m1.id = b.badscan_model_id "
+    "LEFT JOIN models m2 ON m2.id = b.pagetype_model_id "
+)
+
+
+def reviews_with_scans(scan_id: int | None = None) -> list[dict]:
+    """
+    Every review joined to the scan it answers and the pass that produced
+    it (model versions included) — what the example store needs to decide
+    whether a scan is worth keeping and to record how it was kept. Oldest
+    first, so replaying them applies corrections in order.
+    """
+    q = _REVIEW_SCAN_SQL
+    args: tuple = ()
+    if scan_id is not None:
+        q += "WHERE r.scan_id=? "
+        args = (scan_id,)
+    q += "ORDER BY r.created_at, r.id"
+    with get_db() as db:
+        return _rows(db.execute(q, args))
+
+
+def llm_pagetype_labels() -> list[dict]:
+    """
+    Weak page-type labels: LLM-classified scans nobody has reviewed. They
+    bootstrap the local page-type model before much review has happened;
+    a reviewed scan is never in this list, since the reviewer's answer
+    supersedes the guess.
     """
     with get_db() as db:
         rows = _rows(db.execute(
-            "SELECT s.filepath, s.jpeg_path, r.verdict, r.created_at "
-            "FROM reviews r JOIN scans s ON s.id = r.scan_id "
-            "ORDER BY r.created_at"))
-    latest: dict[str, dict] = {}
-    for row in rows:
-        label = "bad_scan" if row["verdict"] in ("true_positive", "false_negative") else "no_bad_scan"
-        latest[row["filepath"]] = {
-            "filepath": row["filepath"],
-            "jpeg_path": row["jpeg_path"],
-            "label": label,
-            "source": "human",
-            # Carried through so the dataset builder can always keep the
-            # images a previous model got wrong.
-            "verdict": row["verdict"],
-        }
-    return list(latest.values())
+            "SELECT s.id AS scan_id, s.filepath, s.jpeg_path, s.page_type, s.processed_at "
+            "FROM scans s "
+            "JOIN (SELECT filepath, MAX(id) AS mid FROM scans GROUP BY filepath) t "
+            "  ON s.id = t.mid "
+            "LEFT JOIN reviews r ON r.scan_id = s.id "
+            "WHERE r.id IS NULL AND s.page_type IS NOT NULL "
+            "AND s.page_type_source LIKE 'llm:%' "
+            "ORDER BY s.processed_at"))
+    return [{
+        "scan_id": r["scan_id"],
+        "filepath": r["filepath"],
+        "jpeg_path": r["jpeg_path"],
+        "label": r["page_type"],
+        "source": "llm",
+    } for r in rows]
 
 
-def labeled_pagetype_examples(include_llm: bool = True) -> list[dict]:
+# ---------------------------------------------------------------------------
+# Annotations (the permanent record of what annotators did and said)
+# ---------------------------------------------------------------------------
+
+def log_annotation(action: str, role: str = "", scan_id: int | None = None,
+                   example_id: int | None = None, filepath: str = "",
+                   old_value: str = "", new_value: str = "", notes: str = "",
+                   reviewer: str = "") -> int:
+    with _write_lock, get_db() as db:
+        cur = db.execute(
+            "INSERT INTO annotations (created_at, reviewer, action, role, scan_id, "
+            " example_id, filepath, old_value, new_value, notes) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (utcnow(), reviewer or "", action, role or "", scan_id, example_id,
+             filepath or "", old_value or "", new_value or "", notes or ""))
+        return cur.lastrowid
+
+
+def list_annotations(scan_id: int | None = None, example_id: int | None = None,
+                     filepath: str = "", limit: int = 200) -> list[dict]:
     """
-    Page-type training labels.
-
-    Human-confirmed labels (latest per file path) are authoritative.
-    With *include_llm*, LLM-classified scans that were never reviewed are
-    added as weak labels — this bootstraps the local page-type model
-    before much manual review has happened. A human label for a file
-    always overrides its LLM label.
+    History for one image, newest first: anything logged against the scan,
+    against the training example made from it, or against its original
+    path (which ties the two together once the scan row is gone).
     """
+    where, args = [], []
+    for col, val in (("scan_id", scan_id), ("example_id", example_id),
+                     ("filepath", filepath)):
+        if val:
+            where.append(f"{col}=?")
+            args.append(val)
+    if not where:
+        return []
+    q = ("SELECT * FROM annotations WHERE " + " OR ".join(where) +
+         " ORDER BY id DESC LIMIT ?")
+    args.append(limit)
     with get_db() as db:
-        rows = _rows(db.execute(
-            "SELECT s.filepath, s.jpeg_path, r.page_type, r.created_at "
-            "FROM reviews r JOIN scans s ON s.id = r.scan_id "
-            "WHERE r.page_type IS NOT NULL AND r.page_type != '' "
-            "ORDER BY r.created_at"))
-    latest: dict[str, dict] = {}
-    for row in rows:
-        latest[row["filepath"]] = {
-            "filepath": row["filepath"],
-            "jpeg_path": row["jpeg_path"],
-            "label": row["page_type"],
-            "source": "human",
-        }
+        return _rows(db.execute(q, args))
 
-    if include_llm:
-        with get_db() as db:
-            rows = _rows(db.execute(
-                "SELECT s.filepath, s.jpeg_path, s.page_type, s.processed_at "
-                "FROM scans s LEFT JOIN reviews r ON r.scan_id = s.id "
-                "WHERE r.id IS NULL AND s.page_type IS NOT NULL "
-                "AND s.page_type_source LIKE 'llm:%' "
-                "ORDER BY s.processed_at"))
-        for row in rows:
-            if row["filepath"] not in latest:
-                latest[row["filepath"]] = {
-                    "filepath": row["filepath"],
-                    "jpeg_path": row["jpeg_path"],
-                    "label": row["page_type"],
-                    "source": "llm",
-                }
-    return list(latest.values())
+
+def recent_annotations(limit: int = 100) -> list[dict]:
+    with get_db() as db:
+        return _rows(db.execute(
+            "SELECT * FROM annotations ORDER BY id DESC LIMIT ?", (limit,)))
+
+
+# ---------------------------------------------------------------------------
+# Image embeddings (similarity search)
+# ---------------------------------------------------------------------------
+
+def save_embeddings(model: str, rows: list[tuple[str, bytes]]) -> None:
+    now = utcnow()
+    with _write_lock, get_db() as db:
+        db.executemany(
+            "INSERT OR REPLACE INTO image_embeddings (path, model, vec, created_at) "
+            "VALUES (?, ?, ?, ?)", [(p, model, v, now) for p, v in rows])
+
+
+def load_embeddings(model: str):
+    """Yield (path, vec_bytes) for every stored embedding from *model*."""
+    with get_db() as db:
+        yield from db.execute(
+            "SELECT path, vec FROM image_embeddings WHERE model=?", (model,))
+
+
+def embeddable_image_paths() -> list[str]:
+    """Every image the app shows: latest scans' previews and training examples."""
+    with get_db() as db:
+        rows = db.execute(
+            "SELECT COALESCE(NULLIF(s.jpeg_path, ''), s.filepath) AS p FROM scans s "
+            "JOIN (SELECT filepath, MAX(id) AS mid FROM scans GROUP BY filepath) t "
+            "  ON s.id = t.mid "
+            "UNION SELECT image_path FROM training_examples").fetchall()
+    return [r["p"] for r in rows if r["p"]]
+
+
+def project_scan_paths(project_id: int, subdir: str | None = None) -> dict[str, int]:
+    """Preview image path -> latest scan id for every file in a project."""
+    p = get_project(project_id)
+    if p is None:
+        return {}
+    clause, args = _project_dir_clause(p, subdir)
+    with get_db() as db:
+        rows = db.execute(
+            "SELECT s.id, COALESCE(NULLIF(s.jpeg_path, ''), s.filepath) AS p FROM scans s "
+            "JOIN (SELECT filepath, MAX(id) AS mid FROM scans GROUP BY filepath) t "
+            "  ON s.id = t.mid WHERE " + clause, args).fetchall()
+    return {r["p"]: r["id"] for r in rows if r["p"]}
+
+
+def training_example_paths(role: str) -> dict[str, int]:
+    """Image path -> example id for one role's training examples."""
+    with get_db() as db:
+        rows = db.execute(
+            "SELECT id, image_path FROM training_examples WHERE role=?", (role,)).fetchall()
+    return {r["image_path"]: r["id"] for r in rows}
 
 
 # ---------------------------------------------------------------------------
@@ -1010,7 +1237,7 @@ def project_stats(project_id: int) -> dict:
 def add_training_example(role: str, label: str, source: str, image_path: str,
                          project_id: int | None = None, scan_id: int | None = None,
                          origin_ref: str = "", notes: str = "",
-                         verdict: str = "") -> int | None:
+                         verdict: str = "", meta: dict | None = None) -> int | None:
     """
     Insert one labeled image. Returns its id, or None if this (role,
     image_path) is already present — re-imports never clobber a label the
@@ -1021,20 +1248,123 @@ def add_training_example(role: str, label: str, source: str, image_path: str,
         cur = db.execute(
             "INSERT OR IGNORE INTO training_examples "
             "(role, label, original_label, source, image_path, project_id, "
-            " scan_id, origin_ref, notes, verdict, active, created_at, updated_at) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,1,?,?)",
+            " scan_id, origin_ref, notes, verdict, meta, active, created_at, updated_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,1,?,?)",
             (role, label, label, source, str(image_path), project_id, scan_id,
-             origin_ref, notes, verdict, now, now),
+             origin_ref, notes, verdict, json.dumps(meta or {}), now, now),
         )
         return cur.lastrowid if cur.rowcount else None
+
+
+def training_example_for_scan(role: str, scan_id: int) -> dict | None:
+    """The example (if any) kept from this scan for *role*."""
+    with get_db() as db:
+        row = db.execute(
+            "SELECT * FROM training_examples WHERE role=? AND scan_id=? "
+            "ORDER BY id DESC LIMIT 1", (role, scan_id)).fetchone()
+        return dict(row) if row else None
+
+
+def get_training_example_by_path(role: str, image_path: str) -> dict | None:
+    with get_db() as db:
+        row = db.execute(
+            "SELECT * FROM training_examples WHERE role=? AND image_path=?",
+            (role, str(image_path))).fetchone()
+        return dict(row) if row else None
+
+
+def scan_kept_copy(scan_id: int) -> str | None:
+    """Path of the kept copy of this scan's image, if an example holds one."""
+    with get_db() as db:
+        row = db.execute(
+            "SELECT image_path FROM training_examples WHERE scan_id=? "
+            "ORDER BY active DESC, id DESC LIMIT 1", (scan_id,)).fetchone()
+    return row["image_path"] if row else None
+
+
+def external_human_examples(role: str, store_prefix: str) -> list[dict]:
+    """
+    Reviewer-labeled examples whose image still lives outside the app's
+    own store (i.e. in a watched folder that may churn). These are
+    candidates for being copied in.
+    """
+    with get_db() as db:
+        return _rows(db.execute(
+            "SELECT * FROM training_examples WHERE role=? AND source='human' "
+            "AND image_path NOT LIKE ? || '%' ORDER BY id", (role, store_prefix)))
+
+
+def latest_scan_for_path(filepath: str) -> dict | None:
+    with get_db() as db:
+        row = db.execute(
+            "SELECT * FROM scans WHERE filepath=? OR jpeg_path=? ORDER BY id DESC LIMIT 1",
+            (filepath, filepath)).fetchone()
+        return dict(row) if row else None
+
+
+def apply_review_label(role: str, image_path: str, label: str,
+                       reviewed_at: str, verdict: str = "") -> bool:
+    """
+    Carry a newer review onto an existing example for the same image, so
+    re-reviewing a scan (or correcting an LLM page type) changes its
+    training label. A correction made on the training-data page after the
+    review is newer and wins.
+    """
+    with _write_lock, get_db() as db:
+        cur = db.execute(
+            "UPDATE training_examples SET label=?, source='human', verdict=?, "
+            "updated_at=? WHERE role=? AND image_path=? AND updated_at < ? "
+            "AND (label != ? OR source != 'human' OR verdict != ?)",
+            (label, verdict, utcnow(), role, str(image_path), reviewed_at,
+             label, verdict),
+        )
+        return cur.rowcount > 0
+
+
+def apply_review_label_by_id(example_id: int, label: str, reviewed_at: str,
+                             verdict: str = "", notes: str = "") -> bool:
+    """
+    Same as :func:`apply_review_label`, addressed by row: a review newer
+    than the row's last edit relabels it (and carries its notes along); an
+    edit made on the training-data page after the review is left alone.
+    """
+    with _write_lock, get_db() as db:
+        cur = db.execute(
+            "UPDATE training_examples SET label=?, source='human', verdict=?, "
+            "notes=CASE WHEN ?<>'' THEN ? ELSE notes END, updated_at=? "
+            "WHERE id=? AND updated_at < ? "
+            "AND (label != ? OR source != 'human' OR verdict != ? "
+            "     OR (?<>'' AND notes != ?))",
+            (label, verdict, notes, notes, utcnow(), example_id, reviewed_at,
+             label, verdict, notes, notes),
+        )
+        return cur.rowcount > 0
+
+
+def training_examples_for_scan(filepath: str, jpeg_path: str | None,
+                               scan_id: int | None = None) -> list[dict]:
+    """Training rows (every role) that were made from this scan's image."""
+    paths = [p for p in (jpeg_path, filepath) if p]
+    marks = ",".join("?" * len(paths)) or "NULL"
+    with get_db() as db:
+        return _rows(db.execute(
+            "SELECT * FROM training_examples "
+            f"WHERE image_path IN ({marks}) OR origin_ref = ? OR scan_id = ? "
+            "ORDER BY role, id",
+            (*paths, filepath, scan_id if scan_id is not None else -1)))
 
 
 def list_training_examples(role: str | None = None, label: str | None = None,
                            source: str | None = None, project_id: int | None = None,
                            active: bool | None = True, corrected_only: bool = False,
                            missing_only: bool = False,
+                           ids: list[int] | None = None,
+                           verdicts: list[str] | None = None,
                            limit: int = 500, offset: int = 0) -> list[dict]:
     where, args = [], []
+    if ids is not None:
+        where.append(f"te.id IN ({','.join('?' * len(ids)) or 'NULL'})")
+        args += list(ids)
     if role:
         where.append("te.role=?"); args.append(role)
     if label:
@@ -1047,6 +1377,9 @@ def list_training_examples(role: str | None = None, label: str | None = None,
         where.append("te.active=?"); args.append(1 if active else 0)
     if corrected_only:
         where.append("te.original_label<>'' AND te.label<>te.original_label")
+    if verdicts:
+        where.append(f"te.verdict IN ({','.join('?' * len(verdicts))})")
+        args += list(verdicts)
     q = ("SELECT te.*, p.name AS project_name FROM training_examples te "
          "LEFT JOIN projects p ON p.id=te.project_id")
     if where:
@@ -1084,12 +1417,15 @@ def get_training_example(example_id: int) -> dict | None:
 
 def update_training_example(example_id: int, **fields) -> None:
     """Correct a label, edit notes, or toggle active (soft delete/restore)."""
-    allowed = {"label", "notes", "active", "source"}
+    allowed = {"label", "notes", "active", "source", "verdict", "meta",
+               "scan_id", "image_path", "project_id"}
     sets = {k: v for k, v in fields.items() if k in allowed}
     if not sets:
         return
     if "active" in sets:
         sets["active"] = 1 if sets["active"] else 0
+    if "meta" in sets and not isinstance(sets["meta"], str):
+        sets["meta"] = json.dumps(sets["meta"] or {})
     sets["updated_at"] = utcnow()
     cols = ", ".join(f"{k}=?" for k in sets)
     with _write_lock, get_db() as db:
@@ -1151,24 +1487,32 @@ def training_example_stats(role: str) -> dict:
         by_source = {r["source"]: r["n"] for r in db.execute(
             "SELECT source, COUNT(*) n FROM training_examples "
             "WHERE role=? AND active=1 GROUP BY source", (role,))}
+        by_verdict = {r["verdict"]: r["n"] for r in db.execute(
+            "SELECT verdict, COUNT(*) n FROM training_examples "
+            "WHERE role=? AND active=1 AND verdict<>'' GROUP BY verdict", (role,))}
         agg = db.execute(
             "SELECT COUNT(*) total, "
             "SUM(active=0) inactive, "
-            "SUM(original_label<>'' AND label<>original_label) corrected "
+            "SUM(original_label<>'' AND label<>original_label) corrected, "
+            "SUM(active=1 AND verdict IN ('false_positive','false_negative')) model_errors "
             "FROM training_examples WHERE role=?", (role,)).fetchone()
     return {
         "by_label": by_label,
         "by_source": by_source,
+        "by_verdict": by_verdict,
         "total_active": sum(by_label.values()),
         "total": agg["total"] or 0,
         "inactive": agg["inactive"] or 0,
         "corrected": agg["corrected"] or 0,
+        "model_errors": agg["model_errors"] or 0,
     }
 
 
 def project_scans(project_id: int, flagged: bool | None = None,
                   reviewed: bool | None = None, page_type: str | None = None,
                   transcribed: bool | None = None, subdir: str | None = None,
+                  scan_ids: list[int] | None = None,
+                  present: bool | None = None, kept: bool | None = None,
                   limit: int = 500, offset: int = 0) -> list[dict]:
     """
     Latest scan per file inside a project's directory, with any review.
@@ -1186,23 +1530,37 @@ def project_scans(project_id: int, flagged: bool | None = None,
     if flagged is True:
         where.append("(s.bad_scan='bad_scan' OR r.verdict='false_negative')")
     elif flagged is False:
-        where.append("s.bad_scan='no_bad_scan' AND r.verdict IS NULL")
+        where.append("s.bad_scan='no_bad_scan' AND (r.verdict IS NULL OR r.verdict='')")
     if reviewed is True:
         where.append("r.id IS NOT NULL")
     elif reviewed is False:
         where.append("r.id IS NULL")
     if page_type:
-        where.append("s.page_type = ?")
+        # The reviewer's page type, when there is one, overrides the guess.
+        where.append("COALESCE(NULLIF(r.page_type, ''), s.page_type) = ?")
         args.append(page_type)
     if transcribed is True:
         where.append("s.transcription IS NOT NULL")
     elif transcribed is False:
         where.append("s.transcription IS NULL")
+    if scan_ids is not None:
+        where.append(f"s.id IN ({','.join('?' * len(scan_ids)) or 'NULL'})")
+        args += list(scan_ids)
+    if present is True:
+        where.append("s.present=1")
+    elif present is False:
+        where.append("s.present=0")
+    if kept is True:
+        where.append("kept_n > 0")
+    elif kept is False:
+        where.append("kept_n = 0")
 
     q = (
         "SELECT s.*, b.label AS batch_label, b.started_at AS batch_started, "
         " r.verdict AS review_verdict, r.page_type AS review_page_type, "
-        " r.notes AS review_notes "
+        " r.notes AS review_notes, r.reviewer AS reviewer, r.created_at AS reviewed_at, "
+        " (SELECT COUNT(*) FROM training_examples te "
+        "   WHERE te.scan_id = s.id AND te.active=1) AS kept_n "
         "FROM scans s "
         "JOIN (SELECT filepath, MAX(id) AS mid FROM scans GROUP BY filepath) t "
         "  ON s.id = t.mid "
@@ -1230,7 +1588,11 @@ def project_scan_counts(project_id: int, subdir: str | None = None) -> dict:
             " SUM(s.bad_scan IS NULL) unknown, "
             " SUM(r.id IS NOT NULL) reviewed, "
             " SUM(s.status='error') errors, "
-            " SUM(s.transcription IS NOT NULL) transcribed "
+            " SUM(s.transcription IS NOT NULL) transcribed, "
+            " SUM(s.present=0) gone, "
+            " SUM(s.present=1) on_disk, "
+            " SUM(EXISTS(SELECT 1 FROM training_examples te "
+            "            WHERE te.scan_id = s.id AND te.active=1)) kept "
             "FROM scans s "
             "JOIN (SELECT filepath, MAX(id) AS mid FROM scans GROUP BY filepath) t "
             "  ON s.id = t.mid "

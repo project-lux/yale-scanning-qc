@@ -52,6 +52,12 @@ CURATED_DIR = DATA_DIR / "curated"
 # Layout: <IMAGES_DIR>/<role>/<source>/<name>.jpg
 IMAGES_DIR = DATA_DIR / "images"
 
+# Scans an annotator kept from the staging folder (see src/preserve.py). One
+# copy per image, shared by every role's example row, named by content hash
+# so a re-pass of the same file lands on the same copy and a re-capture of
+# the same filename does not.
+KEPT_DIR = IMAGES_DIR / "kept"
+
 # Longest side kept for a stored viewing copy. Archival TIFFs are far larger
 # than anything the UI or the trainer needs (training runs at imgsz=640),
 # so only this reduced JPEG is ever copied off the share.
@@ -115,6 +121,23 @@ def all_page_types(settings: dict) -> list[str]:
 PAGETYPE_BASE_WEIGHTS = "yolo11n-cls.pt"
 PAGETYPE_SEED_WEIGHTS = MODELS_DIR / "yolo11n.pt"  # copied from gemini-yolo
 
+# A page-type model may also be a region *detector* (e.g. the freeflow
+# "typed" project: boxes around typed text, handwriting, photographs…). Its
+# boxes are turned into one page type: the mapped class covering the most
+# page area wins, and a page with no mapped box at or above the confidence
+# floor is blank. Detector classes not listed here (table, stamp, passport…)
+# are ignored. A model's own metrics["class_map"] overrides this default.
+PAGETYPE_DETECT_CLASS_MAP = {
+    "typed": "typed_text",
+    "typed_text": "typed_text",
+    "handwriting": "handwriting",
+    "photograph": "photograph",
+    "photo": "photograph",
+    "blank": "blank_page",
+    "blank_page": "blank_page",
+}
+PAGETYPE_DETECT_MIN_CONF = 0.25
+
 # Page types that get sent to the transcription endpoint
 TRANSCRIBE_PAGE_TYPES = ["handwriting"]
 
@@ -148,6 +171,11 @@ DEFAULT_SETTINGS = {
     # projects, to this multiple of the positive count.
     "neg_sample_ratio": "1.5",
     "neg_sample_seed": "",          # blank = a fresh sample per build
+    # The watched folder is a staging area whose files move on within days.
+    # Only scans the annotator says the model got wrong are copied into the
+    # app's own store and kept as training data. Set to 1 to also keep the
+    # ones where annotator and model agreed.
+    "preserve_agreements": "0",
 }
 
 # QC subdirectory names (created under watched directory)
@@ -206,6 +234,6 @@ DETECTION_COLORS = {
 
 # Create directories
 for dir_path in [DATA_DIR, RAW_IMAGES_DIR, AUGMENTED_DIR, MODELS_DIR, MANIFESTS_DIR,
-                 REGISTRY_DIR, DATASETS_DIR, IMAGES_DIR]:
+                 REGISTRY_DIR, DATASETS_DIR, IMAGES_DIR, KEPT_DIR]:
     dir_path.mkdir(parents=True, exist_ok=True)
 

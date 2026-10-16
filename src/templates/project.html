@@ -13,8 +13,12 @@
         {% if project.mode == 'tree' %}<span class="tag src" title="This project mirrors the whole directory tree">directory tree</span>{% endif %}
       </h1>
       <p class="sub" title="{{ project.path }}">{{ project.path }}</p>
+      <p class="sub">A staging folder: files move on once approved. Scans the model got
+        wrong are kept as training data, with your notes; the rest just pass through.</p>
     </div>
     <div class="headactions">
+      <a class="btn" title="This project's scans as a filterable table, with CSV export"
+         href="/records?filters={{ {'project': {'in': [project.name]}} | tojson | urlencode }}">Records / CSV</a>
       <a class="btn" href="/data?project={{ project.id }}">Training data</a>
       <button class="btn" id="reprocessBtn">Reprocess…</button>
       {% if project.mode == 'tree' %}
@@ -64,6 +68,13 @@
         <option value="">All</option>
         <option value="0">Not reviewed</option>
         <option value="1">Reviewed</option>
+        <option value="kept">Kept for training</option>
+      </select></label>
+    <label class="field" title="Files leave this folder once approved or re-captured; 'Gone' shows what was here on an earlier pass"><span>File</span>
+      <select id="fPresent">
+        <option value="1">On disk</option>
+        <option value="0">Gone</option>
+        <option value="">All</option>
       </select></label>
     <label class="field"><span>Page type</span>
       <select id="fPageType"><option value="">All</option></select></label>
@@ -83,17 +94,33 @@
       <select id="fPer"><option>60</option><option>120</option><option>240</option></select></label>
   </section>
 
+  <!-- Similar-image mode: the grid is ranked by likeness to one image -->
+  <section class="simbar" id="simbar" hidden>
+    <img id="simThumb" alt="">
+    <div class="simtext">
+      <strong>Most similar to <span id="simName"></span></strong>
+      <span class="hint" id="simStatus"></span>
+    </div>
+    <label class="field inline"><span>Min similarity</span>
+      <input type="range" id="simMin" min="0" max="95" step="5" value="0">
+      <b id="simMinVal">any</b></label>
+    <button class="btn sm" id="simSelect" title="Select every image shown, then use the bulk bar">Select all shown</button>
+    <button class="btn sm" id="simExit">✕ Back to all</button>
+  </section>
+
   <section class="bulkbar" id="bulkbar" hidden>
     <strong><span id="selCount">0</span> selected</strong>
     <button class="btn sm" id="selAll">Select page</button>
     <button class="btn sm" id="selNone">Clear</button>
     <span class="grow"></span>
-    <label class="field"><span>Page type</span>
+    <label class="field"><span>Set page type</span>
       <select id="bulkPageType"><option value="">— unchanged —</option></select></label>
+    <label class="field"><span>Notes</span>
+      <input class="input" id="bulkNotes" placeholder="applies to each selected scan"></label>
     <button class="btn sm danger" id="bulkBad"
-            title="Review every selected scan as a bad scan; each becomes training data">Flag bad scan</button>
+            title="Review every selected scan as a bad scan; the ones the model missed are kept for training">Flag bad scan</button>
     <button class="btn sm" id="bulkGood"
-            title="Review every selected scan as fine; each becomes training data">Mark fine</button>
+            title="Review every selected scan as fine; the ones the model flagged are kept for training">Mark fine</button>
     <button class="btn sm" id="bulkReprocess">Reprocess selected…</button>
   </section>
 
@@ -116,14 +143,36 @@
       <button class="iconbtn" id="dClose" title="Close (Esc)">✕</button>
     </div>
     <div class="viewerbody">
-      <div class="vimg" id="vImgWrap">
+      <div class="vimg" id="vImgWrap" title="Click to toggle fit / actual size">
         <div class="imgstack" id="imgStack">
           <img id="dImg" alt="">
           <svg id="dOverlay" preserveAspectRatio="xMidYMid meet"></svg>
         </div>
       </div>
       <div class="vside">
+        <fieldset class="dclasses">
+          <legend>Is this a bad scan? <span class="hint">b = bad, g = fine</span></legend>
+          <div class="labelbtns">
+            <button class="labelbtn" id="vBad">Bad scan <kbd>b</kbd></button>
+            <button class="labelbtn" id="vGood">Looks fine <kbd>g</kbd></button>
+          </div>
+          <p class="hint" id="verdictHint"></p>
+        </fieldset>
+
+        <label class="field block"><span>Page type <span class="hint">saves on change</span></span>
+          <select id="dPageType"><option value="">— unchanged —</option></select></label>
+
+        <div class="navrow">
+          <button class="btn sm" id="dPrev" title="Previous scan (← key)">← Prev</button>
+          <button class="btn sm" id="dNext" title="Next scan (→ key)">Next →</button>
+          <button class="btn sm" id="dSimilar" title="Show visually similar scans (s)">≈ Find similar <kbd>s</kbd></button>
+        </div>
+
         <div class="dmeta" id="dMeta"></div>
+
+        <div class="dlabels" id="dTrainLabels"></div>
+
+        <div class="dhistory" id="dHistory"></div>
 
         <div class="dtranscript" id="dTranscript" hidden>
           <div class="dtranshead">
@@ -134,24 +183,8 @@
           <div id="dTranscriptText" class="dtlines"></div>
         </div>
 
-        <fieldset class="dclasses">
-          <legend>Is this a bad scan? <span class="hint">b = bad, g = fine</span></legend>
-          <div class="labelbtns">
-            <button class="labelbtn" id="vBad">Bad scan <kbd>b</kbd></button>
-            <button class="labelbtn" id="vGood">Looks fine <kbd>g</kbd></button>
-          </div>
-          <p class="hint" id="verdictHint"></p>
-        </fieldset>
-
-        <label class="field block"><span>Page type</span>
-          <select id="dPageType"><option value="">— unchanged —</option></select></label>
-        <label class="field block"><span>Notes</span>
+        <label class="field block"><span>Notes <span class="hint">saved with your answer, kept with the image</span></span>
           <textarea id="dNotes" rows="2" placeholder="What is wrong with it…"></textarea></label>
-
-        <div class="navrow">
-          <button class="btn sm" id="dPrev">← Prev (k)</button>
-          <button class="btn sm" id="dNext">Next (j) →</button>
-        </div>
       </div>
     </div>
   </div>

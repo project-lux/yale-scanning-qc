@@ -346,8 +346,10 @@ def _base_weights(role: str) -> tuple[str, str]:
     trained on this task (continual learning), otherwise the stock base.
     """
     active = db.get_active_model(role)
-    if active and inference.model_ready(role) and Path(active["path"]).exists():
+    if active and inference.model_ready(role) and Path(active["path"]).exists() \
+            and not inference.is_detector(role):
         return active["path"], active["version"]
+    # A detector cannot be fine-tuned into a classifier; start from stock.
     return ROLE_BASE_WEIGHTS[role], ROLE_BASE_WEIGHTS[role]
 
 

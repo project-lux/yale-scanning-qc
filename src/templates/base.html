@@ -12,6 +12,8 @@
     <nav class="mainnav">
       <a href="{{ url_for('views.home') }}"
          class="{{ 'on' if active_nav == 'projects' }}">Projects</a>
+      <a href="{{ url_for('views.records_page') }}"
+         class="{{ 'on' if active_nav == 'records' }}">Records</a>
       <a href="{{ url_for('views.data_browser') }}"
          class="{{ 'on' if active_nav == 'data' }}">Training data</a>
       <a href="{{ url_for('views.training_page') }}"

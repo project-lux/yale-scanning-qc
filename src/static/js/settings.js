@@ -13,6 +13,11 @@
       ['neg_sample_seed', 'Sampling seed',
        'Leave blank to draw a different random sample of clean pages on every '
        + 'build. Set a number to make builds reproducible.'],
+      ['preserve_agreements', 'Also keep scans the model got right',
+       'The watched folder is a staging area whose files move on. By default '
+       + 'only scans the annotator says the model got wrong are copied into '
+       + 'the app and kept as training data (0). Set 1 to keep every reviewed '
+       + 'scan.'],
     ]],
     ['Training', [
       ['retrain_epochs', 'Default epochs', ''],

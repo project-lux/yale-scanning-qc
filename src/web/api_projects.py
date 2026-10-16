@@ -3,6 +3,7 @@ Project API. A project is one monitored directory; models and datasets stay
 global so every project shares the same trained models.
 """
 
+import json
 from pathlib import Path
 
 from flask import Blueprint, jsonify, request
@@ -119,20 +120,53 @@ def project_scans(project_id: int):
         return jsonify({"error": "page and per_page must be integers"}), 400
 
     subdir = _subdir_arg(project)
-    rows = db.project_scans(
-        project_id,
+    filters = dict(
         flagged=_bool_arg("flagged"),
         reviewed=_bool_arg("reviewed"),
         page_type=(request.args.get("page_type") or None),
         transcribed=_bool_arg("transcribed"),
         subdir=subdir,
-        limit=per_page,
-        offset=(page - 1) * per_page,
+        # The watched folder is a staging area: files leave it for their
+        # permanent home. Default to what is actually there.
+        present=_bool_arg("present") if "present" in request.args else True,
+        kept=_bool_arg("kept"),
     )
+    similar_to = request.args.get("similar_to")
+    sim_status = None
+    if similar_to:
+        # Rank by visual similarity to one scan instead of by filename; the
+        # filters above still apply to the ranked candidates.
+        from .. import similarity
+
+        query = db.get_scan(int(similar_to))
+        if query is None:
+            return jsonify({"error": "Scan not found"}), 404
+        try:
+            min_score = float(request.args.get("min_score") or 0)
+        except ValueError:
+            min_score = 0.0
+        ranked = similarity.similar(
+            query.get("jpeg_path") or query["filepath"],
+            scope=db.project_scan_paths(project_id, subdir),
+            limit=min(5000, page * per_page * 4 + 200), min_score=min_score)
+        score = dict(ranked)
+        rows = db.project_scans(project_id, **filters, scan_ids=list(score),
+                                limit=len(score) or 1)
+        rows.sort(key=lambda r: -score[r["id"]])
+        rows = rows[(page - 1) * per_page: page * per_page]
+        for r in rows:
+            r["similarity"] = round(score[r["id"]], 4)
+        sim_status = similarity.status()
+    else:
+        rows = db.project_scans(project_id, **filters, limit=per_page,
+                                offset=(page - 1) * per_page)
     root = project["path"]
     for r in rows:
         r["filename"] = Path(r["filepath"]).name
-        r["has_jpeg"] = bool(r["jpeg_path"]) and Path(r["jpeg_path"]).exists()
+        r["kept"] = bool(r.pop("kept_n", 0))
+        # A kept copy stands in for the preview once the file has moved on.
+        r["has_jpeg"] = (bool(r["jpeg_path"]) and Path(r["jpeg_path"]).exists()) \
+            or r["kept"]
         if project.get("mode") == "tree":
             try:
                 r["relpath"] = str(Path(r["filepath"]).relative_to(root))
@@ -143,6 +177,7 @@ def project_scans(project_id: int):
         "page": page,
         "per_page": per_page,
         "counts": db.project_scan_counts(project_id, subdir=subdir),
+        "similarity": sim_status,
     })
 
 
@@ -227,10 +262,13 @@ def rerun_project_stages(project_id: int):
 
     ids = [int(i) for i in (data.get("scan_ids") or [])]
     if not ids:
-        # Whole project when nothing specific is selected.
-        ids = [s["id"] for s in db.project_scans(project_id, limit=1_000_000)]
+        # Whole project when nothing specific is selected — only what is
+        # still in the folder; files that moved on cannot be reprocessed.
+        ids = [s["id"] for s in db.project_scans(project_id, present=True,
+                                                 limit=1_000_000)]
     if not ids:
-        return jsonify({"error": "This project has no scans yet"}), 400
+        return jsonify({"error": "No processed scans are in this folder right now. "
+                                 "Run a pass to process new images."}), 400
 
     def _run():
         try:
@@ -261,8 +299,12 @@ def scan_image(scan_id: int):
     src = Path(scan["jpeg_path"]) if scan["jpeg_path"] else None
     if src is None or not src.exists():
         orig = Path(scan["filepath"])
+        kept = db.scan_kept_copy(scan_id)
         if orig.exists() and orig.suffix.lower() in (".jpg", ".jpeg", ".png"):
             src = orig
+        elif kept and Path(kept).exists():
+            # The file has left the staging folder; the kept copy remains.
+            src = Path(kept)
         else:
             return jsonify({"error": "Preview not available"}), 404
     if request.args.get("full", "").lower() in ("1", "true", "yes", "on"):
@@ -280,7 +322,6 @@ def bulk_verdict(project_id: int):
     """
     from flask import session
 
-    from .. import examples
     from ..config import all_page_types
 
     if db.get_project(project_id) is None:
@@ -299,7 +340,7 @@ def bulk_verdict(project_id: int):
 
     reviewer = session.get("user", "")
     notes = (data.get("notes") or "").strip()
-    reviewed = 0
+    reviewed, kept = 0, 0
     for sid in ids:
         scan = db.get_scan(sid)
         if scan is None:
@@ -309,12 +350,73 @@ def bulk_verdict(project_id: int):
             else ("false_negative" if is_bad else "true_negative")
         db.save_review(sid, verdict, page_type=page_type, notes=notes,
                        reviewer=reviewer)
+        _log_verdict(scan, verdict, notes, reviewer)
+        if page_type and page_type != scan.get("review_page_type"):
+            _log_page_type(scan, page_type, reviewer)
         reviewed += 1
+        if _keep_scan(sid, page_type is not None):
+            kept += 1
+    return jsonify({"reviewed": reviewed, "is_bad": is_bad, "kept": kept})
 
-    examples.sync("badscan")
-    if page_type:
-        examples.sync("pagetype")
-    return jsonify({"reviewed": reviewed, "is_bad": is_bad})
+
+def _log_verdict(scan: dict, verdict: str, notes: str, reviewer: str) -> None:
+    """One annotations row per answer, with what it replaced."""
+    db.log_annotation("verdict", role="badscan", scan_id=scan["id"],
+                      filepath=scan["filepath"],
+                      old_value=scan.get("review_verdict") or "",
+                      new_value=verdict, notes=notes, reviewer=reviewer)
+
+
+def _log_page_type(scan: dict, page_type: str | None, reviewer: str) -> None:
+    db.log_annotation("page_type", role="pagetype", scan_id=scan["id"],
+                      filepath=scan["filepath"],
+                      old_value=scan.get("review_page_type") or "",
+                      new_value=page_type or "", reviewer=reviewer)
+
+
+def _keep_scan(scan_id: int, with_page_type: bool) -> bool:
+    """
+    Fold the scan's review into the training store straight away: a scan
+    the model got wrong is copied in with its metadata; one the model got
+    right is only recorded as a review. Returns whether anything is kept
+    for this scan now.
+    """
+    from .. import examples
+
+    roles = ("badscan", "pagetype") if with_page_type else ("badscan",)
+    examples.sync_scan(scan_id, roles)
+    return db.scan_kept_copy(scan_id) is not None
+
+
+@bp.post("/<int:project_id>/bulk-page-type")
+def bulk_page_type(project_id: int):
+    """Set one reviewed page type on many scans, leaving bad-scan answers alone."""
+    from flask import session
+
+    from .. import examples
+    from ..config import all_page_types
+
+    if db.get_project(project_id) is None:
+        return jsonify({"error": "Not found"}), 404
+    data = request.get_json(force=True, silent=True) or {}
+    ids = [int(i) for i in (data.get("scan_ids") or [])]
+    if not ids:
+        return jsonify({"error": "scan_ids is required"}), 400
+    page_type = (data.get("page_type") or "").strip()
+    if page_type not in all_page_types(db.get_settings()):
+        return jsonify({"error": f"Invalid page type: {page_type}"}), 400
+
+    reviewer = session.get("user", "")
+    updated = 0
+    for sid in ids:
+        scan = db.get_scan(sid)
+        if scan is None:
+            continue
+        db.save_review_page_type(sid, page_type, reviewer=reviewer)
+        _log_page_type(scan, page_type, reviewer)
+        examples.sync_scan(sid, ("pagetype",))
+        updated += 1
+    return jsonify({"updated": updated, "page_type": page_type})
 
 
 @bp.get("/scans/<int:scan_id>/transcriptions")
@@ -323,6 +425,55 @@ def scan_transcriptions(scan_id: int):
     if db.get_scan(scan_id) is None:
         return jsonify({"error": "Scan not found"}), 404
     return jsonify({"transcriptions": db.list_transcriptions(scan_id)})
+
+
+@bp.get("/scans/<int:scan_id>/labels")
+def scan_labels(scan_id: int):
+    """Training-data rows made from this scan, with the label each was imported as."""
+    scan = db.get_scan(scan_id)
+    if scan is None:
+        return jsonify({"error": "Scan not found"}), 404
+    rows = db.training_examples_for_scan(scan["filepath"], scan.get("jpeg_path"),
+                                         scan_id=scan_id)
+    for r in rows:
+        try:
+            r["meta"] = json.loads(r.get("meta") or "{}")
+        except ValueError:
+            r["meta"] = {}
+    return jsonify({"examples": rows})
+
+
+@bp.get("/scans/<int:scan_id>/history")
+def scan_history(scan_id: int):
+    """Every annotator action on this scan, newest first."""
+    scan = db.get_scan(scan_id)
+    if scan is None:
+        return jsonify({"error": "Scan not found"}), 404
+    return jsonify({"history": db.list_annotations(scan_id=scan_id,
+                                                   filepath=scan["filepath"])})
+
+
+@bp.post("/scans/<int:scan_id>/page-type")
+def scan_page_type(scan_id: int):
+    """Set the reviewed page type on its own, without a bad-scan answer."""
+    from flask import session
+
+    from .. import examples
+    from ..config import all_page_types
+
+    scan = db.get_scan(scan_id)
+    if scan is None:
+        return jsonify({"error": "Scan not found"}), 404
+    data = request.get_json(force=True, silent=True) or {}
+    page_type = (data.get("page_type") or "").strip() or None
+    if page_type is not None and page_type not in all_page_types(db.get_settings()):
+        return jsonify({"error": f"Invalid page type: {page_type}"}), 400
+    reviewer = session.get("user", "")
+    db.save_review_page_type(scan_id, page_type, reviewer=reviewer)
+    _log_page_type(scan, page_type, reviewer)
+    examples.sync_scan(scan_id, ("pagetype",))
+    return jsonify({"scan": db.get_scan(scan_id), "page_type": page_type,
+                    "kept": db.scan_kept_copy(scan_id) is not None})
 
 
 @bp.post("/scans/<int:scan_id>/verdict")
@@ -341,7 +492,6 @@ def scan_verdict(scan_id: int):
     """
     from flask import session
 
-    from .. import examples
     from ..config import all_page_types
 
     scan = db.get_scan(scan_id)
@@ -360,11 +510,15 @@ def scan_verdict(scan_id: int):
     if page_type is not None and page_type not in all_page_types(db.get_settings()):
         return jsonify({"error": f"Invalid page type: {page_type}"}), 400
 
-    db.save_review(scan_id, verdict, page_type=page_type,
-                   notes=(data.get("notes") or "").strip(),
-                   reviewer=session.get("user", ""))
-    # Make the verdict training data immediately.
-    examples.sync("badscan")
-    if page_type:
-        examples.sync("pagetype")
-    return jsonify({"scan": db.get_scan(scan_id), "verdict": verdict})
+    reviewer = session.get("user", "")
+    notes = (data.get("notes") or "").strip()
+    db.save_review(scan_id, verdict, page_type=page_type, notes=notes,
+                   reviewer=reviewer)
+    _log_verdict(scan, verdict, notes, reviewer)
+    if page_type and page_type != scan.get("review_page_type"):
+        _log_page_type(scan, page_type, reviewer)
+    # Keep it (copy + metadata) right away when the model got it wrong.
+    kept = _keep_scan(scan_id, page_type is not None)
+    return jsonify({"scan": db.get_scan(scan_id), "verdict": verdict,
+                    "kept": kept, "disagreement": verdict in (
+                        "false_positive", "false_negative")})

@@ -7,8 +7,9 @@
   <div class="pagehead">
     <div>
       <h1>Training data</h1>
-      <p class="sub">Every labeled image the next model will learn from. Click one to
-        see and change its class.</p>
+      <p class="sub">Every labeled image the next model will learn from — including every
+        scan an annotator said the model got wrong, kept here with its metadata and notes
+        after the staging folder has moved on. Click one to see and change its class.</p>
     </div>
     <div class="headactions">
       <label class="field">
@@ -30,6 +31,14 @@
       <select id="fLabel"><option value="">All</option></select></label>
     <label class="field"><span>Source</span>
       <select id="fSource"><option value="">All</option></select></label>
+    <label class="field" title="How the annotator's answer compared with the model's"><span>Outcome</span>
+      <select id="fVerdict">
+        <option value="">All</option>
+        <option value="errors">Model got it wrong</option>
+        <option value="false_positive">False positive (flagged, was fine)</option>
+        <option value="false_negative">False negative (missed a bad scan)</option>
+        <option value="agreements">Model agreed</option>
+      </select></label>
     <label class="field"><span>Project</span>
       <select id="fProject">
         <option value="">All</option>
@@ -52,6 +61,20 @@
   </section>
 
   <!-- Bulk actions, shown only with a selection -->
+  <!-- Similar-image mode: the grid is ranked by likeness to one image -->
+  <section class="simbar" id="simbar" hidden>
+    <img id="simThumb" alt="">
+    <div class="simtext">
+      <strong>Most similar to <span id="simName"></span></strong>
+      <span class="hint" id="simStatus"></span>
+    </div>
+    <label class="field inline"><span>Min similarity</span>
+      <input type="range" id="simMin" min="0" max="95" step="5" value="0">
+      <b id="simMinVal">any</b></label>
+    <button class="btn sm" id="simSelect" title="Select every image shown, then use the bulk bar">Select all shown</button>
+    <button class="btn sm" id="simExit">✕ Back to all</button>
+  </section>
+
   <section class="bulkbar" id="bulkbar" hidden>
     <strong><span id="selCount">0</span> selected</strong>
     <button class="btn sm" id="selAll">Select page</button>
@@ -64,46 +87,57 @@
     <button class="btn sm danger" id="bulkDelete">Delete…</button>
   </section>
 
-  <div class="gridwrap">
-    <div class="grid" id="grid"></div>
-    <p class="empty" id="empty" hidden>Nothing matches these filters.</p>
-    <div class="pager">
-      <button class="btn sm" id="prevPage">← Previous</button>
-      <span id="pageInfo">page 1</span>
-      <button class="btn sm" id="nextPage">Next →</button>
+  <!-- Browsing: the grid fills the page. Reviewing (an image is open): the grid
+       becomes a left sidebar, the image sits in the middle, metadata on the right. -->
+  <div class="dataworkspace" id="workspace">
+    <div class="gridwrap" id="gridwrap">
+      <div class="grid" id="grid"></div>
+      <p class="empty" id="empty" hidden>Nothing matches these filters.</p>
+      <div class="pager">
+        <button class="btn sm" id="prevPage">← Prev</button>
+        <span id="pageInfo">page 1</span>
+        <button class="btn sm" id="nextPage">Next →</button>
+      </div>
     </div>
+
+    <section class="dview" id="drawer" hidden aria-label="Example detail">
+      <div class="dviewimg" id="dImgWrap" title="Click to toggle fit / actual size">
+        <img id="dImg" alt="">
+      </div>
+      <aside class="dviewside">
+        <div class="drawerhead">
+          <strong id="dFilename">—</strong>
+          <button class="iconbtn" id="dClose" title="Close (Esc)">✕</button>
+        </div>
+        <div class="dviewsidebody">
+          <fieldset class="dclasses">
+            <legend>Class <span class="hint">press 1–9</span></legend>
+            <div id="dLabels" class="labelbtns"></div>
+          </fieldset>
+
+          <div class="navrow">
+            <button class="btn sm" id="dPrev" title="Previous image (← key)">← Prev</button>
+            <button class="btn sm" id="dNext" title="Next image (→ key)">Next →</button>
+            <button class="btn sm" id="dSimilar" title="Show visually similar examples (s)">≈ Find similar <kbd>s</kbd></button>
+          </div>
+
+          <div class="dmeta" id="dMeta"></div>
+
+          <label class="field block"><span>Notes</span>
+            <textarea id="dNotes" rows="3" placeholder="Why this label…"></textarea></label>
+
+          <div class="dhistory" id="dHistory"></div>
+
+          <div class="drawerActions">
+            <button class="btn" id="dSave">Save notes</button>
+            <button class="btn" id="dToggle">Exclude</button>
+            <button class="btn danger" id="dDelete">Delete…</button>
+          </div>
+        </div>
+      </aside>
+    </section>
   </div>
 </div>
-
-<!-- Detail drawer -->
-<aside class="drawer" id="drawer" hidden aria-label="Example detail">
-  <div class="drawerhead">
-    <strong id="dFilename">—</strong>
-    <button class="iconbtn" id="dClose" title="Close (Esc)">✕</button>
-  </div>
-  <div class="drawerbody">
-    <div class="dimgwrap"><img id="dImg" alt="" ></div>
-    <div class="dmeta" id="dMeta"></div>
-
-    <fieldset class="dclasses">
-      <legend>Class <span class="hint">press 1–9</span></legend>
-      <div id="dLabels" class="labelbtns"></div>
-    </fieldset>
-
-    <label class="field block"><span>Notes</span>
-      <textarea id="dNotes" rows="3" placeholder="Why this label…"></textarea></label>
-
-    <div class="drawerActions">
-      <button class="btn" id="dSave">Save notes</button>
-      <button class="btn" id="dToggle">Exclude</button>
-      <button class="btn danger" id="dDelete">Delete…</button>
-    </div>
-    <div class="navrow">
-      <button class="btn sm" id="dPrev">← Prev (k)</button>
-      <button class="btn sm" id="dNext">Next (j) →</button>
-    </div>
-  </div>
-</aside>
 {% endblock %}
 
 {% block scripts %}
